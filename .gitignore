@@ -1,0 +1,39 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+coverage/
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
+# Local Codesh state
+.codesh/
+.evolve-staging/
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Personal notes
+todo.txt
+COMMITS.txt
+/FEATURE_AUDIT.md
+
+# Local development tooling
+/.cursor/skills/
+/.impeccable.md
+
+# Package archives
+/*.tgz
+
+# OS and editor noise
+.DS_Store
+.idea/
+.vscode/

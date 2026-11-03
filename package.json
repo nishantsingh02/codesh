@@ -1,0 +1,70 @@
+{
+  "name": "codesh",
+  "version": "0.2.32",
+  "description": "A from-scratch harness for agentic coding.",
+  "author": "Nishant Singh <nraj14908@gmail.com> (https://nishantx.me)",
+  "type": "module",
+  "bin": {
+    "codesh": "./dist/cli.js"
+  },
+  "files": [
+    "dist/cli.js",
+    "dist/prompts/",
+    "src/ui/pi/LICENSE",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md"
+  ],
+  "scripts": {
+    "check-node": "node scripts/ensure-node-version.mjs",
+    "dev": "node scripts/run-development-command.mjs dev",
+    "build": "node scripts/build.mjs",
+    "start": "node scripts/run-development-command.mjs start",
+    "typecheck": "node scripts/run-development-command.mjs typecheck",
+    "test": "node scripts/run-tests.mjs",
+    "pack:dry-run": "npm pack --dry-run --ignore-scripts",
+    "verify": "node scripts/verify-before-push.mjs",
+    "prepack": "npm run build",
+    "prepublishOnly": "node scripts/verify-before-push.mjs"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "coding-agent",
+    "cli",
+    "tui"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nishantsingh211/codesh.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nishantsingh211/codesh/issues"
+  },
+  "homepage": "https://github.com/nishantsingh211/codesh#readme",
+  "dependencies": {
+    "@earendil-works/pi-tui": "0.80.3",
+    "better-sqlite3": "^12.11.1",
+    "chalk": "5.6.2",
+    "commander": "^14.0.2",
+    "diff": "^9.0.0",
+    "dotenv": "^17.2.3",
+    "highlight.js": "^11.11.1",
+    "htmlparser2": "^12.0.0",
+    "turndown": "^7.2.4"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.10.1",
+    "@types/turndown": "^5.0.6",
+    "esbuild": "^0.28.1",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "engines": {
+    "node": ">=22.19.0"
+  }
+}
