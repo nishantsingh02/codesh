@@ -1,0 +1,66 @@
+import type { CodeshConfig } from "./config.js"
+import { createOpenAICompatibleProvider } from "./providers/openai-compatible.js"
+import { createAnthropicProvider } from "./providers/anthropic.js"
+import type { AssistantResponse, Provider, ResolvedProvider, ChatMessage, ToolDefinition, ToolChoice, ModelInfo } from "./providers/types.js"
+
+// Re-export types for backward compatibility
+export type ContentBlock = import("./providers/types.js").ContentBlock
+export type OpenRouterMessage = ChatMessage
+export type OpenRouterToolDefinition = ToolDefinition
+export type OpenRouterToolChoice = ToolChoice
+export type OpenRouterModel = ModelInfo
+export type OpenRouterModelPricing = { completion: number; prompt: number }
+export type OpenRouterUsage = import("./providers/types.js").Usage
+
+function getAdapter(config: CodeshConfig): Provider {
+  if (config.providerConfig.protocol === "anthropic") {
+    return createAnthropicProvider()
+  }
+  return createOpenAICompatibleProvider()
+}
+
+function toResolvedProvider(config: CodeshConfig): ResolvedProvider {
+  return config.providerConfig
+}
+
+export async function completeOpenRouterResponse(
+  config: CodeshConfig,
+  messages: ChatMessage[],
+  options: { model?: string; maxTokens?: number } = {},
+): Promise<string> {
+  return getAdapter(config).completeChat(
+    toResolvedProvider(config),
+    options.model || config.model,
+    messages,
+    config.modelSettings,
+    { maxTokens: options.maxTokens },
+  )
+}
+
+export async function completeOpenRouterToolResponse(
+  config: CodeshConfig,
+  messages: ChatMessage[],
+  tools: ToolDefinition[],
+  options: { maxTokens?: number; toolChoice?: ToolChoice; onTextDelta?: (delta: string) => void } = {},
+  signal?: AbortSignal,
+): Promise<AssistantResponse> {
+  return getAdapter(config).completeToolChat(
+    toResolvedProvider(config),
+    config.model,
+    messages,
+    tools,
+    config.modelSettings,
+    options,
+    signal,
+  )
+}
+
+export async function listOpenRouterModels(config: CodeshConfig): Promise<ModelInfo[]> {
+  return getAdapter(config).listModels(toResolvedProvider(config))
+}
+
+export function isContextOverflowError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+  return /\b(context|token|tokens|input)\b.*\b(length|limit|window|maximum|too large|too long|exceed)/i.test(message)
+    || /\b(maximum context|context_length|context window|too many tokens|input is too long|prompt is too long)\b/i.test(message)
+}
