@@ -1,0 +1,170 @@
+import type { AskQuestionRequest, AskQuestionResponse } from "../questions.js"
+import type { PermissionDecision, PermissionGrantSummary, PermissionRequest } from "../permissions.js"
+import type { CodeshPreferences, ModelSettings, StatusLinePreferences, TerminalLayout } from "../preferences.js"
+import type { TranscriptMessage } from "../session/types.js"
+import type { AgentMode } from "../plan-mode.js"
+import type { ImageAttachment, ImageSource } from "../utils/images.js"
+import type { ResponseMode } from "../response-modes.js"
+import type { TaskStatusSnapshot } from "../tasks/types.js"
+import type { CodeshRelease } from "../release-notes.js"
+
+export type PromptAutocompleteItem = {
+  browsable?: boolean
+  description?: string
+  insertText?: string
+  label: string
+  relatedValue?: string
+  searchText?: string
+  value: string
+}
+
+export type PromptAutocompleteMatch = PromptAutocompleteItem & {
+  selected: boolean
+}
+
+export type StatusNoticeTone = "default" | "warning" | "error" | "success"
+export type SnowIntensity = "off" | "low" | "medium" | "hard"
+
+export type CodeshTerminal = {
+  cancelQueuedPromptEdit(): void
+  clearInteractionPrompts(): void
+  clearToolActivities(): void
+  clearPlanActions(): void
+  requestQuestions(request: AskQuestionRequest): Promise<AskQuestionResponse>
+  requestApproval(request: PermissionRequest): Promise<PermissionDecision>
+  showQuestionPrompt(request: AskQuestionRequest, resolve: (response: AskQuestionResponse) => void): void
+  showApprovalPrompt(request: PermissionRequest, resolve: (decision: PermissionDecision) => void): void
+  run(): Promise<void>
+  stop(): void
+  setBusy(busy: boolean): void
+  setContextUsage(tokens: number, window: number): void
+  setCostUsage(
+    sessionCostUsd?: number,
+    totalCostUsd?: number,
+    completeness?: { sessionIncomplete?: boolean; totalIncomplete?: boolean },
+  ): void
+  setInputDraft(value: string): void
+  setInputDisabled(disabled: boolean): void
+  setStatusLinePreferences(preferences: StatusLinePreferences): void
+  setSessionMeta(meta: { forkParentTitle?: string; title: string }): void
+  setLofi(enabled: boolean): void
+  setResponseModes(modes: ResponseMode[]): void
+  setLayout(layout: TerminalLayout): void
+  setMode(mode: AgentMode, planPath?: string): void
+  setPinnedChats(chats: PinnedChatSummary[]): void
+  setThinking(thinking: boolean, message?: string): void
+  setQueuedPrompts(prompts: QueuedPrompt[]): void
+  setRepoIndexStatus(content?: string, tone?: StatusNoticeTone): void
+  setSnow(intensity: SnowIntensity): void
+  setTaskStatus(snapshot?: TaskStatusSnapshot): void
+  setTipNotice(content?: string): void
+  setTipsEnabled(enabled: boolean): void
+  setSlashCommandItems(items: PromptAutocompleteItem[]): void
+  showModelEditor(
+    choice: ModelChoice,
+    settings: ModelSettings,
+    onSelect: (model: string, settings: ModelSettings, done: boolean) => void,
+    onCancel: () => void,
+  ): void
+  showModelSelector(
+    models: ModelBrowserItem[],
+    currentModelId: string | undefined,
+    onSelect: (model: ModelBrowserItem) => void,
+    onCancel: () => void,
+  ): void
+  showSelectList(title: string, items: SelectListChoice[], onSelect: (value: string) => void, onCancel: () => void): void
+  showPermissions(
+    grants: PermissionGrantSummary[],
+    onRemove: (grant: PermissionGrantSummary) => void,
+    onClearAll: () => void,
+    onCancel: () => void,
+  ): void
+  showPlanActions(planPath: string, onSelect: (action: PlanAction) => void): void
+  showSettings(prefs: CodeshPreferences, onSave: (prefs: CodeshPreferences) => void): void
+  showApiKeySetup(provider: string, label: string, onSave: (key: string) => void, onCancel: () => void): void
+  showProviderSelector(
+    rows: ProviderDisplayRow[],
+    onEdit: (providerId: string) => void,
+    onUse: (providerId: string) => void,
+    onCancel: () => void,
+    onDelete?: (providerId: string) => void,
+  ): void
+  showResumeSearch(): void
+  showSidebar?(): void
+  setModifiedFile?(filePath: string, additions: number, removals: number): void
+  showWhatsNew(release: CodeshRelease, onContinue: () => void): void
+  setModel(model: string, settings: ModelSettings, displayName?: string): void
+  setTheme(theme: string): void
+  setTitle(title: string): void
+  setToolActivities(activities: ToolActivity[]): void
+  clearTranscriptDisplay(): void
+  setStreamingContent(text: string): void
+  setStatusNotice(content?: string, tone?: StatusNoticeTone): void
+  setTranscript(transcript: TranscriptMessage[]): void
+  suspendForEditor(draft: string): Promise<string>
+  insertImageAttachment(source: ImageSource, options?: { displayName?: string; size?: number }): void
+}
+
+export type HistoryChoice = {
+  id: string
+  title: string
+  updatedAt: number
+}
+
+export type ModelChoice = {
+  id: string
+  name: string
+  contextLength: number | null
+  supportedParameters: string[]
+}
+
+export type ModelBrowserItem = ModelChoice & {
+  providerId: string
+  providerLabel: string
+}
+
+export type SelectListChoice = {
+  description?: string
+  label: string
+  value: string
+}
+
+export type ToolActivity = {
+  args: string
+  id: string
+  name: string
+  result?: string
+  status: "running" | "done" | "failed"
+}
+
+export type ContextUsage = {
+  limit?: number | null
+  tokens: number
+}
+
+export type QueuedPrompt = {
+  createdAt: number
+  hidden?: boolean
+  id: string
+  images?: ImageAttachment[]
+  source?: string
+  text: string
+}
+
+export type PlanAction = "execute" | "refine" | "stay"
+
+export type ProviderDisplayRow = {
+  canDelete: boolean
+  id: string
+  displayName: string
+  sourceLabel: string
+  status: "configured" | "unconfigured" | "active"
+  protocol: string
+}
+
+export type PinnedChatSummary = {
+  id: string
+  slot: number
+  title: string
+  working: boolean
+}
