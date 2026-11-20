@@ -1,0 +1,352 @@
+import assert from "node:assert/strict"
+import { test } from "node:test"
+import { buildRuntimeContext, entriesToModelMessages, entriesToTranscript } from "../dist/session/context.js"
+
+test("runtime context includes current date and workspace", () => {
+  const context = buildRuntimeContext({
+    cwd: "C:\\code\\codesh",
+    now: new Date("2026-06-20T17:48:00.000Z"),
+    platform: "win32",
+  })
+
+  assert.match(context, /Runtime context:/)
+  assert.match(context, /Current ISO timestamp: 2026-06-20T17:48:00.000Z/)
+  assert.match(context, /Current year: 2026/)
+  assert.match(context, /Current workspace: C:\\code\\codesh/)
+  assert.match(context, /Operating system: Windows \(win32\)/)
+  assert.match(context, /Shell command syntax: PowerShell/)
+  assert.match(context, /latest, current, recent, today, and now/)
+})
+
+test("model messages include transient runtime context", () => {
+  const messages = entriesToModelMessages(
+    "base system",
+    [
+      {
+        id: "entry-1",
+        parentEntryId: null,
+        sessionId: "session-1",
+        type: "message",
+        role: "user",
+        data: { content: "latest FIFA news" },
+        model: null,
+        createdAt: 0,
+      },
+    ],
+    { cwd: "/tmp/codesh", now: new Date("2026-06-20T17:48:00.000Z") },
+  )
+
+  assert.equal(messages[0].role, "system")
+  assert.equal(messages[0].content, "base system")
+  assert.equal(messages[0].cacheControl, "ephemeral")
+  assert.equal(messages[1].role, "user")
+  assert.match(messages[1].content, /Current year: 2026/)
+  assert.deepEqual(messages[2], { role: "user", content: "latest FIFA news" })
+})
+
+test("hidden messages are replayed to the model but omitted from transcript", () => {
+  const entries = [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: { content: "visible user prompt" },
+      createdAt: 0,
+    },
+    {
+      id: "entry-2",
+      parentEntryId: "entry-1",
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: { content: "background subagent completion", hidden: true, source: "background_subagent_completion" },
+      createdAt: 1,
+    },
+  ]
+
+  assert.deepEqual(entriesToTranscript(entries), [{ role: "user", content: "visible user prompt", imageCount: 0 }])
+  assert.deepEqual(entriesToModelMessages("base system", entries), [
+    { role: "system", content: "base system", cacheControl: "ephemeral" },
+    { role: "user", content: "visible user prompt" },
+    { role: "user", content: "background subagent completion" },
+  ])
+})
+
+test("model messages insert stub tool results for interrupted tool calls", () => {
+  const messages = entriesToModelMessages("base system", [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: { content: "run something" },
+      createdAt: 0,
+    },
+    {
+      id: "entry-2",
+      parentEntryId: "entry-1",
+      sessionId: "session-1",
+      type: "tool_call",
+      role: "assistant",
+      data: { arguments: "{\"command\":\"sleep 30\"}", name: "bash", toolCallId: "call_orphan" },
+      createdAt: 1,
+    },
+    {
+      id: "entry-3",
+      parentEntryId: "entry-2",
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: { content: "hello" },
+      createdAt: 2,
+    },
+  ])
+
+  assert.deepEqual(messages.slice(1), [
+    { role: "user", content: "run something" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_orphan", type: "function", function: { name: "bash", arguments: "{\"command\":\"sleep 30\"}" } }],
+    },
+    {
+      role: "tool",
+      name: "bash",
+      tool_call_id: "call_orphan",
+      content: "Tool call interrupted or result was not recorded.",
+    },
+    { role: "user", content: "hello" },
+  ])
+})
+
+test("model messages replay persisted tool calls and results", () => {
+  const messages = entriesToModelMessages("base system", [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: { content: "read notes" },
+      model: null,
+      createdAt: 0,
+    },
+    {
+      id: "entry-2",
+      parentEntryId: "entry-1",
+      sessionId: "session-1",
+      type: "tool_call",
+      role: "assistant",
+      data: { arguments: "{\"path\":\"notes.txt\"}", name: "read", toolCallId: "call_1" },
+      createdAt: 1,
+    },
+    {
+      id: "entry-3",
+      parentEntryId: "entry-2",
+      sessionId: "session-1",
+      type: "tool_result",
+      role: "tool",
+      data: { content: "1|hello", name: "read", toolCallId: "call_1" },
+      createdAt: 2,
+    },
+    {
+      id: "entry-4",
+      parentEntryId: "entry-3",
+      sessionId: "session-1",
+      type: "message",
+      role: "assistant",
+      data: { content: "notes say hello" },
+      createdAt: 3,
+    },
+  ])
+
+  assert.deepEqual(messages, [
+    { role: "system", content: "base system", cacheControl: "ephemeral" },
+    { role: "user", content: "read notes" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "read", arguments: "{\"path\":\"notes.txt\"}" } }],
+    },
+    { role: "tool", name: "read", tool_call_id: "call_1", content: "1|hello" },
+    { role: "assistant", content: "notes say hello" },
+  ])
+})
+
+test("model messages interleave [Image #N] tokens with matching image blocks in order", () => {
+  const messages = entriesToModelMessages("base system", [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: {
+        content: "compare [Image #1] to [Image #2] please",
+        images: [
+          { type: "base64", media_type: "image/png", data: "AAA", label: "1" },
+          { type: "base64", media_type: "image/png", data: "BBB", label: "2" },
+        ],
+      },
+      createdAt: 0,
+    },
+  ])
+
+  assert.deepEqual(messages[1], {
+    role: "user",
+    content: [
+      { type: "text", text: "compare " },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+      { type: "text", text: " to " },
+      { type: "image_url", image_url: { url: "data:image/png;base64,BBB" } },
+      { type: "text", text: " please" },
+    ],
+  })
+})
+
+test("model messages omit empty leading/trailing text blocks around a boundary image token", () => {
+  const messages = entriesToModelMessages("base system", [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: {
+        content: "[Image #1] what is this",
+        images: [{ type: "base64", media_type: "image/png", data: "AAA", label: "1" }],
+      },
+      createdAt: 0,
+    },
+  ])
+
+  assert.deepEqual(messages[1], {
+    role: "user",
+    content: [
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+      { type: "text", text: " what is this" },
+    ],
+  })
+})
+
+test("model messages fall back to trailing image append when content has no image tokens", () => {
+  const messages = entriesToModelMessages("base system", [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: {
+        content: "no tokens here",
+        images: [{ type: "base64", media_type: "image/png", data: "AAA" }],
+      },
+      createdAt: 0,
+    },
+  ])
+
+  assert.deepEqual(messages[1], {
+    role: "user",
+    content: [
+      { type: "text", text: "no tokens here" },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+    ],
+  })
+})
+
+test("model messages keep an unmatched image token as literal text", () => {
+  const messages = entriesToModelMessages("base system", [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: {
+        content: "see [Image #1] and [Image #9]",
+        images: [{ type: "base64", media_type: "image/png", data: "AAA", label: "1" }],
+      },
+      createdAt: 0,
+    },
+  ])
+
+  assert.deepEqual(messages[1], {
+    role: "user",
+    content: [
+      { type: "text", text: "see " },
+      { type: "image_url", image_url: { url: "data:image/png;base64,AAA" } },
+      { type: "text", text: " and [Image #9]" },
+    ],
+  })
+})
+
+test("model messages project latest compaction summary plus kept suffix", () => {
+  const entries = [
+    {
+      id: "entry-1",
+      parentEntryId: null,
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: { content: "old request" },
+      createdAt: 0,
+    },
+    {
+      id: "entry-2",
+      parentEntryId: "entry-1",
+      sessionId: "session-1",
+      type: "message",
+      role: "assistant",
+      data: { content: "old answer" },
+      createdAt: 1,
+    },
+    {
+      id: "entry-3",
+      parentEntryId: "entry-2",
+      sessionId: "session-1",
+      type: "message",
+      role: "user",
+      data: { content: "kept request" },
+      createdAt: 2,
+    },
+    {
+      id: "entry-4",
+      parentEntryId: "entry-3",
+      sessionId: "session-1",
+      type: "compaction",
+      role: "system",
+      data: {
+        firstKeptEntryId: "entry-3",
+        kind: "context_compaction",
+        model: "test-model",
+        reason: "manual",
+        summary: "Old work was summarized.",
+        tokensBefore: 100,
+      },
+      createdAt: 3,
+    },
+    {
+      id: "entry-5",
+      parentEntryId: "entry-4",
+      sessionId: "session-1",
+      type: "message",
+      role: "assistant",
+      data: { content: "new answer" },
+      createdAt: 4,
+    },
+  ]
+
+  const messages = entriesToModelMessages("base system", entries)
+
+  assert.equal(messages[0].role, "system")
+  assert.equal(messages[0].cacheControl, "ephemeral")
+  assert.equal(messages[1].role, "user")
+  assert.match(messages[1].content, /Old work was summarized/)
+  assert.deepEqual(messages.slice(2), [
+    { role: "user", content: "kept request" },
+    { role: "assistant", content: "new answer" },
+  ])
+})
