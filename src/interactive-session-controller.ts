@@ -1,0 +1,3599 @@
+import { spawnSync } from "node:child_process"
+import { existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs"
+import { readFile, writeFile } from "node:fs/promises"
+import { resolve } from "node:path"
+import readline from "node:readline"
+import { runAgentTurn } from "./agent/loop.js"
+import { applyHeadroomLiteRequestTransforms } from "./compression/request-transform.js"
+import { argumentScopeFor, isHistoryCommand, isKnownSlashCommand, parseSlashCommand } from "./commands/builtins.js"
+import { isApiKeyMissing, loadConfig } from "./config.js"
+import { calculateUsageCostUsd, summarizeUsageCosts } from "./session/usage-cost.js"
+import { resolveModelPricing } from "./session/model-pricing.js"
+import { LofiPlayer } from "./lofi.js"
+import { listOpenRouterModels, type OpenRouterMessage, type OpenRouterModel, type OpenRouterToolDefinition } from "./openrouter.js"
+import { setStoredKey, removeStoredKey } from "./providers/keys.js"
+import { BUILTIN_PROVIDERS, resolveProvider } from "./providers/registry.js"
+import { loadCustomProviders } from "./providers/custom.js"
+import { createModelListCache, modelsForProvider, type ProviderModel } from "./providers/catalog.js"
+import { activateProvider, resolveProviderKey } from "./providers/resolution.js"
+import type { CustomProvider, ProviderDefinition } from "./providers/types.js"
+import { SessionPermissionStore, type PermissionGrantSummary } from "./permissions.js"
+import type { PermissionDecision, PermissionRequest } from "./permissions.js"
+import { appendPlanModeGuidance, currentPlanModeState, renderPlanExecutionPrompt, renderVisiblePlanArtifact, transitionPlanMode, type AgentMode, type PlanModeEntryData } from "./plan-mode.js"
+import { acknowledgeReleaseVersion, saveGlobalPreferences, saveModelPreferences, saveThemePreference, statusLinePreferencesFrom, type CodeshPreferences, type ModelSettings } from "./preferences.js"
+import { compactSessionIfNeeded, estimateRequestTokens, resolveCompactionSettings, type CompactionReason } from "./session/compaction.js"
+import { entriesToModelMessages, entriesToTranscript, pendingToolCalls } from "./session/context.js"
+import { resolveForkEntryId } from "./session/navigation.js"
+import { fallbackTitle, generateSessionTitle } from "./session/title.js"
+import type { SessionStore } from "./session/store.js"
+import type { CompactionEntryData, MessageEntryData, SessionRecord, ToolCallEntryData, ToolResultEntryData } from "./session/types.js"
+import { loadCustomCommands, renderCustomCommandTemplate } from "./commands/custom/loader.js"
+import type { CustomCommand } from "./commands/custom/types.js"
+import { PromptQueueStore, type PromptQueueInput } from "./prompt-queue.js"
+import { appendResponseModeGuidance, responseModeNames, toggleResponseMode, type ResponseMode } from "./response-modes.js"
+import { recordRepoIndexOnboardingDecision, shouldOfferRepoIndex } from "./repo-index/core.js"
+import { createRepoIndexService, type RepoIndexService } from "./repo-index/service.js"
+import { appendSkillGuidance, renderSkillInvocationMessage } from "./skills/context.js"
+import { loadSkillByName, loadSkills } from "./skills/loader.js"
+import type { Skill } from "./skills/types.js"
+import { isSkillCommand, slashAutocompleteItems } from "./commands/autocomplete.js"
+import { TaskManager, makeTaskId, type TaskManagerOptions } from "./tasks/manager.js"
+import type { TaskRecord } from "./tasks/types.js"
+import { createSessionTerminalBridge, runtimeUiFor, type SessionRuntimeUi } from "./ui/session-terminal-bridge.js"
+import { childToolDefinitions, toolDefinitions } from "./tools/registry.js"
+import type { CodeshTerminal, PromptAutocompleteItem, PromptAutocompleteMatch, QueuedPrompt, SnowIntensity, StatusNoticeTone, ToolActivity } from "./ui/terminal-types.js"
+import type { EvolveOutcome } from "./evolve/types.js"
+import type { EvolveMigrationState } from "./evolve/migration.js"
+import type { ImageAttachment } from "./utils/images.js"
+import { acceptedLinesForTool, renderUsageReport } from "./usage/summary.js"
+import { readKeyUsage, recordAcceptedLines, recordTurnUsage, removeAcceptedLines } from "./usage/store.js"
+import { UsageViewState } from "./ui/usage-view-state.js"
+import { TipScheduler } from "./ui/tips.js"
+import { TaskDetailsViewState } from "./ui/task-details-view-state.js"
+import { TranscriptViewState } from "./ui/transcript-view-state.js"
+
+export const INTERRUPTED_MESSAGE = "Interrupted."
+import type { AskQuestionRequest, AskQuestionResponse } from "./questions.js"
+import { findTheme, resolveTheme, themeChoices } from "./ui/themes/index.js"
+import {
+  renderAssistantStart,
+  renderConversation,
+  renderDone,
+} from "./ui/plain-output.js"
+import { packageName, packageVersion } from "./version.js"
+import { codeshReleases, unacknowledgedCodeshRelease } from "./release-notes.js"
+
+export function isWorkingSessionNavigationCommand(name: string): boolean {
+  return name === "/new" || isHistoryCommand(name)
+}
+
+export const MISSING_API_KEY_NOTICE = "No API key configured. Use /login to configure API keys."
+
+export async function runInteractive(input: {
+  config: Awaited<ReturnType<typeof loadConfig>>
+  cwd: string
+  sessionId: string
+  store: SessionStore
+  shouldClear: boolean
+}): Promise<void> {
+  if (input.shouldClear) clearTerminalViewportAndScrollback()
+  let sessionId = input.sessionId
+  let pinnedChatIds = normalizePinnedChatIds(input.config.pinnedChatIds)
+  const resumeSearchCache = new Map<string, { searchText: string; updatedAt: number }>()
+  const permissions = new SessionPermissionStore()
+  const lofi = new LofiPlayer()
+  const activeResponseModes = new Set<ResponseMode>()
+  let snowIntensity: SnowIntensity = "off"
+  const pendingBackgroundRecords = new Map<string, TaskRecord[]>()
+  const promptQueues = new PromptQueueStore()
+  const queuedPromptEditPositions = new Map<string, number>()
+  const pendingBackgroundPrompts = new Map<string, string[]>()
+  let modelListCache = createModelListCache(input.config)
+  let skillCatalog = await loadSkills(input.cwd, { extraPaths: input.config.skillPaths })
+  let customCommands: CustomCommand[] = await loadCustomCommands(input.cwd)
+  let baseAutocompleteItems: PromptAutocompleteItem[] = []
+  let currentAutocompleteScope: ReturnType<typeof argumentScopeFor> | undefined
+  let previewedTheme: string | undefined
+  const runningSessionIds = new Set<string>()
+  let activeDisplaySessionId = sessionId
+  const activeAbortControllers = new Map<string, AbortController>()
+  const unreadCompletedSessionIds = new Set<string>()
+  const pendingApprovals = new Map<string, { request: PermissionRequest; resolve: (decision: PermissionDecision) => void }>()
+  const pendingQuestions = new Map<string, { request: AskQuestionRequest; resolve: (response: AskQuestionResponse) => void }>()
+  const pendingPlanActions = new Map<string, { onSelect: (action: "execute" | "refine" | "stay") => void; planPath: string }>()
+  const sessionRuntimeUi = new Map<string, SessionRuntimeUi>()
+  const taskDetailsView = new TaskDetailsViewState()
+  const transcriptView = new TranscriptViewState()
+  let transientStatusTimer: ReturnType<typeof setTimeout> | undefined
+  let transientStatusToken = 0
+  let persistentUpgradeNotice: string | undefined
+  let upgradeNoticeTimer: ReturnType<typeof setTimeout> | undefined
+  let repoIndexOnboardingRunning = false
+  const usageViewState = new UsageViewState()
+  let repoIndexService!: RepoIndexService
+  let tipScheduler!: TipScheduler
+  let repoIndexStatusTimer: ReturnType<typeof setTimeout> | undefined
+  const initialSession = input.store.getSession(sessionId)
+  let terminal!: CodeshTerminal
+  const isCurrentSessionRunning = (): boolean => repoIndexOnboardingRunning || runningSessionIds.has(sessionId)
+  const isSessionRunning = (id: string): boolean => runningSessionIds.has(id)
+  const currentAbortController = (): AbortController | undefined => activeAbortControllers.get(sessionId)
+  const taskManager = createSubagentTaskManager({
+    cwd: input.cwd,
+    executeChildTask: (record, signal, manager) => runSubagentTask({ config: input.config, cwd: input.cwd, permissions, record, signal, store: input.store, taskManager: manager, terminal: terminalForSession(record.parentSessionId) }),
+    onGroupComplete: ({ backgrounded, parentSessionId, records }) => {
+      if (backgrounded) {
+        const pendingRecords = [...(pendingBackgroundRecords.get(parentSessionId) || []), ...records]
+        pendingBackgroundRecords.set(parentSessionId, pendingRecords)
+      }
+      if (hasActiveSubagentTasks(taskManager.status(parentSessionId).tasks)) return
+      const pendingRecords = pendingBackgroundRecords.get(parentSessionId)
+      if (!pendingRecords || pendingRecords.length === 0) return
+      pendingBackgroundRecords.delete(parentSessionId)
+      const prompt = formatBackgroundTaskCompletion(pendingRecords)
+      if (parentSessionId === activeDisplaySessionId) {
+        void enqueueOrRunSyntheticPrompt(prompt)
+        return
+      }
+      const pending = pendingBackgroundPrompts.get(parentSessionId) || []
+      pending.push(prompt)
+      pendingBackgroundPrompts.set(parentSessionId, pending)
+    },
+    onUpdate: (snapshot) => {
+      terminalForSession(snapshot.parentSessionId).setTaskStatus(snapshot)
+      if (snapshot.parentSessionId === activeDisplaySessionId && taskDetailsView.isVisible(snapshot.parentSessionId)) {
+        renderTaskDetails(snapshot.tasks)
+      }
+      syncPinnedChats()
+    },
+    permissions,
+    store: input.store,
+  })
+  const { createCodeshTerminal } = await import("./ui/pi-terminal.js")
+  terminal = createCodeshTerminal({
+    cwd: input.cwd,
+    layout: input.config.layout,
+    statusLine: input.config.statusLine,
+    model: input.config.model,
+    modelSettings: input.config.modelSettings,
+    onQueueEdit: (id) => {
+      return beginQueuedPromptEdit(id)
+    },
+    onQueueEditCancel: (prompt) => {
+      restoreEditedQueuedPrompt(prompt)
+    },
+    onQueueEditDelete: (prompt) => {
+      deleteEditedQueuedPrompt(prompt)
+    },
+    onQueueEditSave: (prompt, sendNow, resumeQueue) => {
+      saveEditedQueuedPrompt(prompt, sendNow, resumeQueue)
+    },
+    onQueuePromote: (id) => {
+      promoteQueuedPrompt(id)
+    },
+    onQueueRemove: (id) => {
+      removeQueuedPrompt(id)
+    },
+    onInterrupt: () => {
+      if (usageViewState.dismiss()) {
+        refreshCurrentSession()
+        return
+      }
+      interruptCurrentTurn(true)
+    },
+    onTaskBackground: () => {
+      const promoted = taskManager.promoteActiveGroup(sessionId)
+      showTransientStatus(promoted ? "Subagents moved to background. You can keep chatting; results will return here when ready." : "No active foreground subagents to background.")
+    },
+    onTaskStatus: () => showTaskStatus(true),
+    onPinnedSelect: switchToPinnedChat,
+    onPinnedToggleCurrent: toggleCurrentChatPin,
+    onPinnedUnpin: unpinPinnedChat,
+    onModeCycle: (direction) => {
+      tipScheduler?.activity()
+      if (isCurrentSessionRunning()) {
+        showTransientStatus("Mode switching is available after the current turn finishes.")
+        return
+      }
+      const current = currentPlanModeState(input.store.getActivePath(sessionId)).mode
+      void switchMode(current === "plan" ? "agent" : "plan", { reason: "user", seed: direction > 0 ? "plan" : "agent" }).catch((error) => showTransientStatus(formatError(error)))
+    },
+    onInputChange: (value) => {
+      tipScheduler?.activity()
+      if (isCurrentSessionRunning()) return
+      const scope = argumentScopeFor(value)
+      if (!scope) {
+        if (currentAutocompleteScope !== undefined) {
+          if (currentAutocompleteScope === "theme" && previewedTheme && previewedTheme !== input.config.theme) terminal.setTheme(input.config.theme)
+          previewedTheme = undefined
+          currentAutocompleteScope = undefined
+          terminal.setSlashCommandItems(baseAutocompleteItems)
+        }
+        return
+      }
+      if (currentAutocompleteScope === scope) return
+      if (currentAutocompleteScope === "theme" && previewedTheme && previewedTheme !== input.config.theme) terminal.setTheme(input.config.theme)
+      previewedTheme = undefined
+      currentAutocompleteScope = scope
+      if (scope === "theme") {
+        terminal.setSlashCommandItems(themeAutocompleteItems())
+      } else if (scope === "history") {
+        const commandName = value.toLowerCase().startsWith("/history") ? "/history" : "/resume"
+        terminal.setSlashCommandItems(resumeAutocompleteItems(input.store.listHistorySessions(input.cwd), commandName))
+      } else if (scope === "fork") {
+        terminal.setSlashCommandItems(forkAutocompleteItems())
+      } else {
+        void modelListCache.promise.then((models) => {
+          if (currentAutocompleteScope === "model") terminal.setSlashCommandItems(modelAutocompleteItems(models))
+        })
+      }
+    },
+    onAutocompleteTab: (match) => {
+      if (match.value.startsWith("/resume ") || match.value.startsWith("/history ")) {
+        togglePinnedChatFromResumeValue(match.value)
+        const commandName = match.value.startsWith("/history ") ? "/history" : "/resume"
+        terminal.setSlashCommandItems(resumeAutocompleteItems(input.store.listHistorySessions(input.cwd), commandName))
+        return true
+      }
+      if (!match.value.startsWith("/model ") || !modelListCache.settled) return false
+      const modelId = match.value.slice("/model ".length).trim()
+      void modelListCache.promise.then((models) => {
+        const choice = models.find((entry) => entry.providerId === input.config.provider && entry.id === modelId)
+        if (!choice) return
+        terminal.showModelEditor(
+          choice,
+          choice.id === input.config.model ? input.config.modelSettings : {},
+          (_model, settings, done) => {
+            void applyModelSelection(choice, settings, { persist: done, refresh: done })
+          },
+          () => refreshCurrentSession(),
+        )
+      })
+      return true
+    },
+
+    onAutocompleteHover: (match) => {
+      if (currentAutocompleteScope !== "theme") return
+      const value = match?.value || ""
+      const themeName = value.startsWith("/theme ") ? value.slice("/theme ".length).trim() : ""
+      const choice = themeName ? findTheme(themeName) : undefined
+      if (!choice || previewedTheme === choice.name) return
+      previewedTheme = choice.name
+      terminal.setTheme(choice.name)
+    },
+    onOpenEditor: (draft) => {
+      if (isCurrentSessionRunning()) {
+        showTransientStatus("Editor is available after the current turn finishes.")
+        return Promise.resolve(draft)
+      }
+      return terminal.suspendForEditor(draft)
+    },
+    onCopy: () => {
+      const activePath = input.store.getActivePath(sessionId)
+      const lastAssistant = [...activePath].reverse().find((entry) => entry.type === "message" && entry.role === "assistant")
+      if (!lastAssistant) {
+        showTransientStatus("Nothing to copy yet.")
+        return
+      }
+      const content = (lastAssistant.data as { content: string }).content
+      copyToClipboard(content)
+      showTransientStatus("Copied to clipboard.")
+    },
+    themeName: input.config.theme,
+    tipsEnabled: input.config.tipsEnabled,
+    typingIndicatorBlink: input.config.typingIndicatorBlink,
+    typingIndicator: input.config.typingIndicator,
+    title: initialSession.title,
+    onSubmit: (prompt, images) => {
+      dispatchInteractiveSubmit(prompt, images)
+    },
+    onSubmitNow: (prompt, images) => {
+      dispatchInteractiveSubmit(prompt, images, true)
+    },
+  })
+  tipScheduler = new TipScheduler({
+    enabled: input.config.tipsEnabled,
+    isEligible: () => {
+      const mode = currentPlanModeState(input.store.getActivePath(sessionId)).mode
+      return mode === "agent"
+        && !isCurrentSessionRunning()
+        && !repoIndexOnboardingRunning
+        && !usageViewState.visible
+        && !pendingApprovals.has(sessionId)
+        && !pendingQuestions.has(sessionId)
+        && !pendingPlanActions.has(sessionId)
+        && !hasActiveSubagentTasks(taskManager.status(sessionId).tasks)
+    },
+    setTip: (tip) => {
+      terminal.setTipNotice(tip ? `Tip: ${tip.command} — ${tip.description}` : undefined)
+    },
+  })
+  repoIndexService = createRepoIndexService({
+    config: input.config,
+    cwd: input.cwd,
+    getModels: () => modelListCache.promise,
+    onStatus: (status) => {
+      if (repoIndexStatusTimer) clearTimeout(repoIndexStatusTimer)
+      const tone = status.state === "failed"
+        ? "error"
+        : status.state === "warning"
+          ? "warning"
+          : status.state === "success"
+            ? "success"
+            : "default"
+      terminal.setRepoIndexStatus(status.message || undefined, tone)
+      if (status.state !== "running" && status.message) {
+        repoIndexStatusTimer = setTimeout(() => terminal.setRepoIndexStatus(undefined), status.state === "failed" ? 8000 : 4000)
+      }
+    },
+  })
+  applyBaseAutocompleteItems(slashAutocompleteItems(skillCatalog.skills, customCommands))
+  syncPersistentStatusNotice()
+  // Session refresh clears stale plan-action UI by restoring the editor, so it
+  // must finish before the startup modal is mounted.
+  refreshCurrentSession()
+  const terminalDone = terminal.run()
+  const initialModelSync = syncModelDisplayFromCache()
+  void Promise.allSettled([initialModelSync]).then(async () => {
+    // Model synchronization refreshes the session UI, so mount What’s New only
+    // after that final startup refresh can no longer replace the panel.
+    await maybeShowWhatsNew()
+    void (async () => {
+      await maybeRunEvolveMigration()
+      await maybeRunRepoIndexOnboarding()
+    })().catch((error) => {
+      showTransientStatus(`Startup task failed: ${formatError(error)}`, 6000)
+    }).finally(() => {
+      tipScheduler.start()
+    })
+  })
+
+  // Non-blocking startup update check — highlighted briefly, then dismissed.
+  void checkForUpdate().then((notice) => {
+    if (notice) {
+      persistentUpgradeNotice = notice
+      syncPersistentStatusNotice()
+      upgradeNoticeTimer = setTimeout(() => {
+        persistentUpgradeNotice = undefined
+        upgradeNoticeTimer = undefined
+        syncPersistentStatusNotice()
+      }, 8000)
+      upgradeNoticeTimer.unref?.()
+    }
+  })
+
+  try {
+    await terminalDone
+  } finally {
+    clearTransientStatus()
+    if (upgradeNoticeTimer) clearTimeout(upgradeNoticeTimer)
+    if (repoIndexStatusTimer) clearTimeout(repoIndexStatusTimer)
+    tipScheduler.stop()
+    repoIndexService.stop()
+    lofi.stop()
+  }
+
+  function dispatchInteractiveSubmit(prompt: string, images?: ImageAttachment[], sendNow = false): void {
+    const submittedSessionId = sessionId
+    void handleInteractiveSubmit(prompt, images, { sendNow }).catch((error) => {
+      runningSessionIds.delete(submittedSessionId)
+      activeAbortControllers.delete(submittedSessionId)
+      if (activeDisplaySessionId === submittedSessionId) terminal.setBusy(false)
+      process.stdout.write("\x07")
+      if (activeDisplaySessionId === submittedSessionId) {
+        terminal.setThinking(false)
+        terminal.setTranscript([...displayTranscript(submittedSessionId), { role: "assistant", content: formatError(error) }])
+      }
+    })
+  }
+
+  async function handleInteractiveSubmit(prompt: string, images?: ImageAttachment[], options: { sendNow?: boolean } = {}): Promise<void> {
+    tipScheduler.activity()
+    const command = parseSlashCommand(prompt)
+
+    // Bare messages (non-slash) need an API key. Slash commands always pass through.
+    if (!command.name.startsWith("/") && isApiKeyMissing(input.config)) {
+      showTransientStatus(MISSING_API_KEY_NOTICE, 6000, "warning")
+      return
+    }
+    if (command.name === "/exit" || command.name === "/quit") {
+      currentAbortController()?.abort()
+      lofi.stop()
+      terminal.stop()
+      return
+    }
+    if (command.name === "/lofi") {
+      const result = lofi.toggle()
+      terminal.setLofi(result.enabled)
+      showTransientStatus(result.message)
+      return
+    }
+    if (command.name === "/snow") {
+      const requested = command.argument.trim().toLowerCase()
+      if (requested && requested !== "low" && requested !== "medium" && requested !== "hard") {
+        showTransientStatus("Usage: /snow [low|medium|hard]. Run /snow without an intensity to toggle it.", 6000)
+        return
+      }
+      snowIntensity = requested
+        ? requested as SnowIntensity
+        : snowIntensity === "off" ? "medium" : "off"
+      terminal.setSnow(snowIntensity)
+      showTransientStatus(snowIntensity === "off" ? "Snowfall off." : `Snowfall ${snowIntensity}.`)
+      return
+    }
+    if (command.name === "/tip" || command.name === "/tips") {
+      input.config.tipsEnabled = !input.config.tipsEnabled
+      tipScheduler.setEnabled(input.config.tipsEnabled)
+      terminal.setTipsEnabled(input.config.tipsEnabled)
+      await saveGlobalPreferences({ tipsEnabled: input.config.tipsEnabled }).catch((error) => {
+        showTransientStatus(`Failed to save tip preference: ${formatError(error)}`, 8000)
+      })
+      showTransientStatus(`Idle tips ${input.config.tipsEnabled ? "on" : "off"}.`)
+      return
+    }
+    if (command.name === "/stfu" || command.name === "/caveman") {
+      const mode = command.name.slice(1) as ResponseMode
+      const enabled = toggleResponseMode(activeResponseModes, mode)
+      terminal.setResponseModes(responseModeNames.filter((candidate) => activeResponseModes.has(candidate)))
+      showTransientStatus(`${command.name} mode ${enabled ? "on" : "off"}. Applies to the next agent response.`)
+      return
+    }
+    if (command.name === "/evolve") {
+      if (isCurrentSessionRunning()) {
+        showTransientStatus("/evolve is available after the current turn finishes.")
+        return
+      }
+      await handleEvolveCommand(command.argument)
+      return
+    }
+    if (command.name === "/evolve-merge") {
+      if (isCurrentSessionRunning()) {
+        showTransientStatus("/evolve-merge is available after the current turn finishes.")
+        return
+      }
+      await handleEvolveMergeCommand()
+      return
+    }
+    if (command.name === "/reset") {
+      if (isCurrentSessionRunning()) {
+        showTransientStatus("/reset is available after the current turn finishes.")
+        return
+      }
+      await handleResetCommand()
+      return
+    }
+    if (command.name === "/clear") {
+      transcriptView.clear(sessionId, input.store.getActivePath(sessionId))
+      terminal.clearTranscriptDisplay()
+      return
+    }
+    if (command.name === "/image") {
+      await handleImageCommand(command.argument)
+      return
+    }
+    if (isSkillCommand(command.name)) {
+      if (isCurrentSessionRunning()) {
+        showTransientStatus(`${command.name} is available after the current turn finishes.`)
+        return
+      }
+      await runSkillCommand(command.name, command.argument)
+      return
+    }
+    if (isWorkingSessionNavigationCommand(command.name)) {
+      if (command.name === "/new") {
+        clearTransientStatus()
+        const currentSession = input.store.getSession(sessionId)
+        const next = currentSession.activeLeafId ? input.store.createSession({ cwd: input.cwd, title: "New Chat" }) : currentSession
+        activateSession(next.id)
+        return
+      }
+      if (command.argument) resumeSessionByToken(command.argument)
+      else openResumeSearch()
+      return
+    }
+    if (isCurrentSessionRunning() && prompt.startsWith("/")) {
+      if (command.name === "/tasks") {
+        showTaskStatus(false)
+        return
+      }
+      if (command.name === "/skills") {
+        await handleSkillsCommand(command.argument)
+        return
+      }
+      if (command.name === "/compact") {
+        showTransientStatus("/compact is available after the current turn finishes.")
+        return
+      }
+      if (command.name === "/init") {
+        showTransientStatus("/init is available after the current turn finishes.")
+        return
+      }
+      if (command.name === "/fork" || command.name === "/clone") {
+        showTransientStatus(`${command.name} is available after the current turn finishes.`)
+        return
+      }
+      if (command.name === "/plan" || command.name === "/agent" || command.name === "/mode") {
+        showTransientStatus(`${command.name} is available after the current turn finishes.`)
+        return
+      }
+      if (command.name === "/permissions") {
+        openPermissionsPanel()
+        return
+      }
+      if (command.name === "/theme" && command.argument) {
+        await setThemeByName(command.argument)
+        return
+      }
+      showTransientStatus(isKnownSlashCommand(command.name) ? `${command.name} is available after the current turn finishes.` : `Unknown command while Codesh is working: ${command.name}`)
+      return
+    }
+    if (isCurrentSessionRunning()) {
+      promptQueues.resume(sessionId)
+      const queued = enqueuePrompt(prompt, { images })
+      if (options.sendNow) promoteQueuedPrompt(queued.id)
+      return
+    }
+    if (command.name === "/plan") {
+      await switchMode("plan", { reason: "user", seed: command.argument || "plan" })
+      if (command.argument) await runPromptQueue(command.argument)
+      return
+    }
+    if (command.name === "/agent") {
+      await switchMode("agent", { reason: "user" })
+      return
+    }
+    if (command.name === "/mode") {
+      await handleModeCommand(command.argument)
+      return
+    }
+    if (command.name === "/permissions") {
+      openPermissionsPanel()
+      return
+    }
+    if (command.name === "/login") {
+      await openLoginPanel()
+      return
+    }
+    if (command.name === "/init") {
+      await runRepoIndexInitialization({ manual: true })
+      return
+    }
+    if (command.name === "/settings" || command.name === "/prefs") {
+      const currentPrefs: CodeshPreferences = {
+        layout: input.config.layout,
+        typingIndicator: input.config.typingIndicator,
+        typingIndicatorBlink: input.config.typingIndicatorBlink,
+        notifications: input.config.notifications,
+        repoIndexPolicy: input.config.repoIndexPolicy,
+        tipsEnabled: input.config.tipsEnabled,
+        model: input.config.model,
+        theme: input.config.theme,
+        modelSettings: input.config.modelSettings,
+        ...input.config.statusLine,
+      }
+      terminal.showSettings(currentPrefs, async (updated) => {
+        Object.assign(input.config, {
+          layout: updated.layout ?? input.config.layout,
+          typingIndicator: updated.typingIndicator ?? input.config.typingIndicator,
+          typingIndicatorBlink: updated.typingIndicatorBlink === true,
+          notifications: updated.notifications === true,
+          repoIndexPolicy: updated.repoIndexPolicy ?? input.config.repoIndexPolicy,
+          tipsEnabled: updated.tipsEnabled !== false,
+          statusLine: statusLinePreferencesFrom(updated),
+        })
+        tipScheduler.setEnabled(input.config.tipsEnabled)
+        terminal.setTipsEnabled(input.config.tipsEnabled)
+        repoIndexService.setPolicy(input.config.repoIndexPolicy)
+        terminal.setLayout(input.config.layout)
+        terminal.setStatusLinePreferences(input.config.statusLine)
+        try {
+          await saveGlobalPreferences(updated)
+          showTransientStatus("Settings saved globally.", 1800)
+        } catch (error) {
+          showTransientStatus(`Failed to save settings: ${formatError(error)}`, 8000)
+        }
+      })
+      return
+    }
+    if (command.name === "/tasks") {
+      showTaskStatus(false)
+      return
+    }
+    if (command.name === "/skills") {
+      await handleSkillsCommand(command.argument)
+      return
+    }
+    if (command.name === "/compact") {
+      await compactCurrentSession(command.argument)
+      return
+    }
+    if (command.name === "/fork") {
+      await handleForkCommand(command.argument)
+      return
+    }
+    if (command.name === "/clone") {
+      await handleForkCommand("current")
+      return
+    }
+    if (command.name === "/model") {
+      if (command.argument) {
+        await setModelByArgument(command.argument)
+        return
+      }
+      const models = await modelListCache.promise
+        .then((available) => modelsForProvider(available, input.config.provider))
+        .catch(() => [] as ProviderModel[])
+      if (models.length === 0) {
+        showTransientStatus("No models available for the active provider. Use /login to choose a configured provider.")
+        return
+      }
+      openModelPicker(models, () => {})
+      return
+    }
+    if (command.name === "/providers" || command.name === "/models") {
+      await openModelBrowser()
+      return
+    }
+    if (command.name === "/theme") {
+      if (command.argument) {
+        await setThemeByName(command.argument)
+        return
+      }
+      showTransientStatus(`Current theme: ${resolveTheme(input.config.theme).name}. Type /theme <name> to change.`)
+      return
+    }
+    if (command.name === "/status") {
+      showStatusSummary()
+      return
+    }
+    if (command.name === "/change") {
+      await showLatestChanges()
+      return
+    }
+    if (command.name === "/export") {
+      await exportConversation(command.argument)
+      return
+    }
+    if (command.name === "/diff") {
+      await showSessionDiff()
+      return
+    }
+    if (command.name === "/sidebar") {
+      await syncSidebarModifiedFiles()
+      terminal.showSidebar?.()
+      return
+    }
+    if (command.name === "/undo") {
+      await undoLastFileChange()
+      return
+    }
+    if (command.name === "/copy") {
+      const activePath = input.store.getActivePath(sessionId)
+      const lastAssistant = [...activePath].reverse().find((entry) => entry.type === "message" && entry.role === "assistant")
+      if (!lastAssistant) { showTransientStatus("Nothing to copy yet."); return }
+      const content = (lastAssistant.data as { content: string }).content
+      copyToClipboard(content)
+      showTransientStatus("Copied to clipboard.")
+      return
+    }
+    if (command.name === "/cost") {
+      await showCostSummary()
+      return
+    }
+    if (command.name === "/usage") {
+      showUsageSummary()
+      return
+    }
+    if (command.name === "/pin") {
+      toggleCurrentChatPin()
+      return
+    }
+    if (command.name === "/pins") {
+      const slot = Number.parseInt(command.argument.trim(), 10)
+      if (Number.isInteger(slot)) switchToPinnedChat(slot)
+      else showPinnedChatHint()
+      return
+    }
+    if (command.name === "/editor") {
+      if (isCurrentSessionRunning()) { showTransientStatus("Editor is available after the current turn finishes."); return }
+      const current = ""
+      const result = await terminal.suspendForEditor(current)
+      if (result.trim()) await runPromptQueue(result.trim())
+      return
+    }
+    if (command.name === "/bug") {
+      const title = command.argument.trim()
+      const url = `https://github.com/nishantsingh211/codesh/issues/new${title ? `?title=${encodeURIComponent(title)}` : ""}`
+      const opener = process.platform === "darwin" ? "open" : "xdg-open"
+      const result = spawnSync(opener, [url])
+      if (result.status !== 0) showTransientStatus(`File a bug at: ${url}`, 8000)
+      else showTransientStatus("Opening browser for bug report.")
+      return
+    }
+
+    // Custom user-defined slash commands
+    const customCmd = customCommands.find((c) => `/${c.name}` === command.name)
+    if (customCmd) {
+      if (isCurrentSessionRunning()) {
+        showTransientStatus(`/${customCmd.name} is available after the current turn finishes.`)
+        return
+      }
+      clearTransientStatus()
+      const rendered = renderCustomCommandTemplate(customCmd.template, command.argument)
+      await runPromptQueue({ hidden: true, source: "custom_command", text: rendered })
+      return
+    }
+
+    clearTransientStatus()
+    if (promptQueues.isPaused(sessionId)) {
+      enqueuePrompt(prompt, { images })
+      promptQueues.resume(sessionId)
+      startNextQueuedPromptIfIdle()
+      return
+    }
+    await runPromptQueue(prompt, images)
+  }
+
+  function showTransientStatus(content: string, ttlMs = 3000, tone?: StatusNoticeTone): void {
+    clearTransientStatus()
+    const token = ++transientStatusToken
+    terminal.setStatusNotice(content, tone)
+    transientStatusTimer = setTimeout(() => {
+      if (token !== transientStatusToken) return
+      transientStatusTimer = undefined
+      syncPersistentStatusNotice()
+    }, ttlMs)
+    transientStatusTimer.unref?.()
+  }
+
+  async function promptForEvolveRestart(recoveryId?: string, message = "Codesh was updated and verified."): Promise<boolean> {
+    const recovery = recoveryId
+      ? `\nIf startup breaks, recover with:\n\ncodesh --recover ${recoveryId}`
+      : ""
+    const response = await terminal.requestQuestions({
+      questions: [
+        {
+          id: "restart",
+          allowCustom: false,
+          allowMultiple: false,
+          prompt: `${message}\n\nRestart now to load the change.${recovery}`,
+          options: [
+            { id: "restart", label: "Restart now" },
+            { id: "later", label: "Restart later" },
+          ],
+        },
+      ],
+    })
+    if (response.rejected || !response.answers.some((answer) => answer.optionId === "restart")) return false
+    const { scheduleCodeshRestart } = await import("./evolve/restart.js")
+    scheduleCodeshRestart()
+    terminal.stop()
+    return true
+  }
+
+  async function maybeRunEvolveMigration(): Promise<void> {
+    const { isPublishedCodeshEntry } = await import("./evolve/activation.js")
+    if (!isPublishedCodeshEntry()) return
+    const {
+      attemptEvolveMigration,
+      disableAutomaticEvolveMigrations,
+      dismissEvolveMigrationForVersion,
+      evolveMigrationFailurePrompt,
+    } = await import("./evolve/migration.js")
+    let restartRequested = false
+    terminal.setBusy(true)
+    terminal.setInputDisabled(true)
+    try {
+      const result = await attemptEvolveMigration({
+        currentVersion: packageVersion,
+        onStatus: (message) => showTransientStatus(message, 12000),
+      })
+      if (result.status === "migrated") {
+        restartRequested = await promptForEvolveRestart(
+          result.recoveryId,
+          `Your previous evolve changes were reapplied to Codesh ${packageVersion} and verified.`,
+        )
+        return
+      }
+      if (result.status !== "pending") return
+      const response = await terminal.requestQuestions({
+        questions: [
+          {
+            id: "migration",
+            allowCustom: false,
+            allowMultiple: false,
+            allowRefuse: false,
+            prompt: evolveMigrationFailurePrompt(result.state),
+            options: [
+              { id: "prepare", label: "Reapply previous evolve changes" },
+              { id: "later", label: "Later" },
+              { id: "never", label: "Don’t ask again" },
+            ],
+          },
+        ],
+      })
+      if (!response.rejected && response.answers.some((answer) => answer.optionId === "prepare")) {
+        await handleEvolveMergeCommand()
+      } else if (!response.rejected && response.answers.some((answer) => answer.optionId === "later")) {
+        await dismissEvolveMigrationForVersion(result.state.toVersion)
+      } else if (!response.rejected && response.answers.some((answer) => answer.optionId === "never")) {
+        await disableAutomaticEvolveMigrations()
+      }
+    } finally {
+      if (!restartRequested) {
+        terminal.setBusy(false)
+        terminal.setInputDisabled(false)
+      }
+    }
+  }
+
+  async function handleEvolveCommand(argument: string): Promise<void> {
+    const request = argument.trim()
+    let restartRequested = false
+    const { readEvolveMigrationState } = await import("./evolve/migration.js")
+    if (await readEvolveMigrationState()) {
+      showTransientStatus("Resolve the pending evolved-change migration with /evolve-merge before running /evolve.", 8000)
+      return
+    }
+    if (!request) {
+      terminal.setInputDraft("/evolve ")
+      showTransientStatus("Describe what to change in codesh, e.g. /evolve add cost to the statusline.", 6000)
+      return
+    }
+
+    const { resolveOrPrepareCodeshRoot } = await import("./evolve/root.js")
+    terminal.setInputDisabled(true)
+    let rootResult: Awaited<ReturnType<typeof resolveOrPrepareCodeshRoot>>
+    try {
+      rootResult = await resolveOrPrepareCodeshRoot({
+        onStatus: (message) => showTransientStatus(message, 12000),
+      })
+    } catch (error) {
+      terminal.setInputDisabled(false)
+      showTransientStatus(`Evolve source preparation failed: ${formatError(error)}`, 12000)
+      return
+    }
+    if (!rootResult.available) {
+      terminal.setInputDisabled(false)
+      showTransientStatus(rootResult.message, 12000)
+      return
+    }
+
+    const { runEvolve } = await import("./evolve/orchestrator.js")
+    const evolveSession = input.store.createSession({ cwd: rootResult.root, relationType: "subagent", title: `evolve: ${request}` })
+    // Broad session grant for the evolve edit turn (KTD9 — permissions are
+    // session-scoped, not path-scoped; the content-level diff review is the control).
+    permissions.applyDecision(
+      { args: "", callId: "evolve", cwd: rootResult.root, description: "evolve", pattern: "*", permission: "*", sessionId: evolveSession.id, toolName: "*" },
+      "allow_all_session",
+    )
+
+    terminal.setInputDisabled(true)
+    try {
+      const outcome = await runEvolve({
+        request,
+        rootResult,
+        interaction: {
+          notify: (message) => showTransientStatus(message, 12000),
+          confirmApply: async ({ diff, createdFiles, verifyLog }) => {
+            const response = await terminal.requestQuestions({
+              questions: [
+                {
+                  id: "apply",
+                  allowCustom: false,
+                  allowMultiple: false,
+                  prompt: renderEvolveConsentPrompt(diff, createdFiles, verifyLog),
+                  options: [
+                    { id: "apply", label: "Apply change" },
+                    { id: "discard", label: "Discard the change (revert)" },
+                  ],
+                },
+              ],
+            })
+            if (response.rejected) return false
+            return response.answers.some((answer) => answer.optionId === "apply")
+          },
+          runEditTurn: async ({ root, request: editRequest }) => {
+            await runSingleTurn({
+              config: input.config,
+              cwd: root,
+              prompt: renderEvolveEditPrompt(editRequest, root),
+              sessionId: evolveSession.id,
+              store: input.store,
+              permissions,
+              terminal,
+              hiddenUserMessage: true,
+              hiddenUserMessageSource: "evolve",
+            })
+          },
+        },
+      })
+      if (outcome.status === "applied") {
+        if (await promptForEvolveRestart(outcome.recoveryId)) {
+          restartRequested = true
+          return
+        }
+      }
+      // Non-applied outcomes and deferred restarts remain visible in history.
+      input.store.appendMessage(sessionId, "assistant", renderEvolveOutcomeMessage(request, outcome), input.config.model)
+    } catch (error) {
+      input.store.appendMessage(sessionId, "assistant", `Evolve failed: ${formatError(error)}`, input.config.model)
+    } finally {
+      if (!restartRequested) {
+        terminal.setThinking(false)
+        terminal.setBusy(false)
+        terminal.setInputDisabled(false)
+        refreshCurrentSession()
+      }
+    }
+  }
+
+  async function handleEvolveMergeCommand(): Promise<void> {
+    if (isApiKeyMissing(input.config)) {
+      showTransientStatus("An API key is required for /evolve-merge. Use /login first.", 8000)
+      return
+    }
+
+    const {
+      completePendingEvolveMigration,
+      preparePendingEvolveMigrationCheckout,
+      readEvolveMigrationState,
+    } = await import("./evolve/migration.js")
+    let restartRequested = false
+    terminal.setBusy(true)
+    terminal.setInputDisabled(true)
+    terminal.setThinking(true, "Preparing evolve migration")
+    try {
+      if (!(await readEvolveMigrationState())) {
+        showTransientStatus("No evolved-change migration needs manual resolution.")
+        return
+      }
+      const prepared = await preparePendingEvolveMigrationCheckout({
+        onStatus: (message) => showTransientStatus(message, 12000),
+      })
+      if (!prepared.ok) {
+        const message = `Evolve merge could not prepare a repair checkout: ${prepared.message}`
+        input.store.appendMessage(sessionId, "assistant", message, input.config.model)
+        showTransientStatus(message, 12000)
+        return
+      }
+      const state = prepared.state
+      if (!existsSync(state.oldRoot) && (!state.patchPath || !existsSync(state.patchPath))) {
+        const message = "Evolve merge cannot recover these changes because both the previous evolved source and its saved patch are unavailable."
+        input.store.appendMessage(sessionId, "assistant", message, input.config.model)
+        showTransientStatus(message, 12000)
+        return
+      }
+
+      const mergeSession = input.store.createSession({
+        cwd: state.targetRoot,
+        relationType: "subagent",
+        title: `evolve merge: ${state.fromVersion} → ${state.toVersion}`,
+      })
+      permissions.applyDecision(
+        { args: "", callId: "evolve-merge", cwd: state.targetRoot, description: "evolve merge", pattern: "*", permission: "*", sessionId: mergeSession.id, toolName: "*" },
+        "allow_all_session",
+      )
+
+      terminal.setThinking(true, "Resolving evolve migration")
+      await runSingleTurn({
+        config: input.config,
+        cwd: state.targetRoot,
+        prompt: renderEvolveMergePrompt(state),
+        sessionId: mergeSession.id,
+        store: input.store,
+        permissions,
+        terminal,
+        hiddenUserMessage: true,
+        hiddenUserMessageSource: "evolve",
+      })
+
+      const diff = spawnSync("git", ["--no-pager", "diff", "--stat", "HEAD"], {
+        cwd: state.targetRoot,
+        encoding: "utf8",
+      })
+      const response = await terminal.requestQuestions({
+        questions: [
+          {
+            id: "apply",
+            allowCustom: false,
+            allowMultiple: false,
+            prompt: `Reapply these previous evolve changes to the new Codesh version?\n\n${(diff.stdout || "").trim() || "No diff summary available."}`,
+            options: [
+              { id: "apply", label: "Verify and reapply changes" },
+              { id: "later", label: "Keep unresolved for later" },
+            ],
+          },
+        ],
+      })
+      if (response.rejected || !response.answers.some((answer) => answer.optionId === "apply")) {
+        showTransientStatus("Evolve migration remains pending.", 5000)
+        return
+      }
+
+      const completed = await completePendingEvolveMigration({
+        onStatus: (message) => showTransientStatus(message, 12000),
+      })
+      if (!completed.ok) {
+        const message = `Evolve migration is still unresolved: ${completed.message}. Run /evolve-merge again after correcting it.`
+        input.store.appendMessage(sessionId, "assistant", message, input.config.model)
+        showTransientStatus(message, 12000)
+        return
+      }
+      restartRequested = await promptForEvolveRestart(
+        completed.recoveryId,
+        `Your previous evolve changes were reapplied to Codesh ${state.toVersion} and verified.`,
+      )
+    } catch (error) {
+      const message = `Evolve merge failed: ${formatError(error)}. The migration remains saved; run /evolve-merge to retry.`
+      input.store.appendMessage(sessionId, "assistant", message, input.config.model)
+      showTransientStatus(message, 12000)
+    } finally {
+      if (!restartRequested) {
+        terminal.setThinking(false)
+        terminal.setBusy(false)
+        terminal.setInputDisabled(false)
+        refreshCurrentSession()
+      }
+    }
+  }
+
+  async function handleResetCommand(): Promise<void> {
+    const { resolveOrPrepareCodeshRoot } = await import("./evolve/root.js")
+    terminal.setInputDisabled(true)
+    const rootResult = await resolveOrPrepareCodeshRoot({
+      onStatus: (message) => showTransientStatus(message, 12000),
+    })
+    terminal.setInputDisabled(false)
+    if (!rootResult.available) {
+      showTransientStatus(rootResult.message, 8000)
+      return
+    }
+    const { pointsForRoot, resetToBaseline } = await import("./evolve/recovery.js")
+    const points = pointsForRoot(rootResult.root)
+    if (points.length === 0) {
+      showTransientStatus("No evolve changes recorded — codesh is already at its default state.", 6000)
+      return
+    }
+
+    const undoing = points.map((point) => `• ${point.description}`).join("\n")
+    const created = [...new Set(points.flatMap((point) => point.createdFiles))]
+    const createdNote = created.length > 0 ? `\n\nFiles that will be removed:\n${created.map((path) => `• ${path}`).join("\n")}` : ""
+    const response = await terminalForSession(sessionId).requestQuestions({
+      questions: [
+        {
+          id: "reset",
+          allowCustom: false,
+          allowMultiple: false,
+          prompt: `Reset codesh to its default state? This reverts the harness source to before your first evolve and discards these ${points.length} evolve change(s):\n\n${undoing}${createdNote}\n\nGit-committed work is kept.`,
+          options: [
+            { id: "reset", label: "Reset to default" },
+            { id: "cancel", label: "Cancel" },
+          ],
+        },
+      ],
+    })
+    if (response.rejected || !response.answers.some((answer) => answer.optionId === "reset")) {
+      showTransientStatus("Reset cancelled.")
+      return
+    }
+
+    terminal.setInputDisabled(true)
+    try {
+      const result = resetToBaseline(rootResult.root)
+      if (result.ok) {
+        showTransientStatus(`Reset codesh to default (undid ${result.undoneCount} evolve change(s)). Restart codesh to load the default harness.`, 12000)
+      } else {
+        showTransientStatus(`Reset failed: ${result.message}`, 8000)
+      }
+    } finally {
+      terminal.setInputDisabled(false)
+      refreshCurrentSession()
+    }
+  }
+
+  function syncPersistentStatusNotice(): void {
+    if (transientStatusTimer) return
+    const notice = missingApiKeyNotice()
+    if (notice) {
+      terminal.setStatusNotice(notice, "warning")
+      return
+    }
+    if (persistentUpgradeNotice) {
+      terminal.setStatusNotice(persistentUpgradeNotice, "warning")
+      return
+    }
+    terminal.setStatusNotice(undefined)
+  }
+
+  function maybeShowWhatsNew(): Promise<void> {
+    const release = unacknowledgedCodeshRelease(packageVersion, input.config.acknowledgedReleaseVersions)
+    if (!release) return Promise.resolve()
+
+    return new Promise((resolve) => {
+      terminal.showWhatsNew(release, () => {
+        void acknowledgeReleaseVersion(packageVersion)
+          .then(() => {
+            input.config.acknowledgedReleaseVersions = [
+              ...new Set([...input.config.acknowledgedReleaseVersions, packageVersion]),
+            ]
+          })
+          .catch((error) => {
+            showTransientStatus(`Could not save What’s New acknowledgement: ${formatError(error)}`, 6000)
+          })
+          .finally(resolve)
+      })
+    })
+  }
+
+  function showLatestChanges(): Promise<void> {
+    const release = codeshReleases()[0]
+    if (!release) {
+      showTransientStatus("No Codesh release notes are available.")
+      return Promise.resolve()
+    }
+    return new Promise((resolve) => {
+      terminal.showWhatsNew(release, resolve)
+    })
+  }
+
+  function missingApiKeyNotice(): string | undefined {
+    if (!isApiKeyMissing(input.config)) return undefined
+    return MISSING_API_KEY_NOTICE
+  }
+
+  async function maybeRunRepoIndexOnboarding(): Promise<void> {
+    if (isApiKeyMissing(input.config)) return
+    if (!(await shouldOfferRepoIndex(input.cwd))) return
+
+    const response = await terminal.requestQuestions({
+      questions: [
+        {
+          allowCustom: false,
+          allowMultiple: false,
+          allowRefuse: false,
+          id: "repo_index",
+          prompt: "Initialize Codesh for this git repo? Codesh will spend a little time learning the codebase and save a local `.codesh/repo-index.md` guide.",
+          options: [
+            { id: "yes", label: "Yes, learn this repo now" },
+            { id: "no", label: "Not now" },
+          ],
+        },
+      ],
+    })
+    const answer = response.answers.find((item) => item.questionId === "repo_index")
+    if (response.rejected) return
+    if (answer?.optionId === "no") {
+      await recordRepoIndexOnboardingDecision(input.cwd, "declined")
+      showTransientStatus("Okay — Codesh will not ask again. Run /init whenever you want to create the index.", 6000)
+      return
+    }
+    if (answer?.optionId !== "yes") return
+
+    await runRepoIndexInitialization({ manual: false })
+  }
+
+  async function runRepoIndexInitialization(options: { manual: boolean }): Promise<void> {
+    if (isApiKeyMissing(input.config)) {
+      showTransientStatus("No API key configured. Use /login first, then run /init.", 6000)
+      return
+    }
+
+    repoIndexOnboardingRunning = true
+    terminal.setBusy(true)
+    terminal.setInputDisabled(true)
+    try {
+      await repoIndexService.request(options.manual ? "manual" : "onboarding")
+    } finally {
+      repoIndexOnboardingRunning = false
+      terminal.setInputDisabled(false)
+      terminal.setBusy(false)
+      syncPersistentStatusNotice()
+    }
+  }
+
+  function refreshModelListCache(): void {
+    modelListCache = createModelListCache(input.config)
+    syncModelDisplayFromCache(modelListCache)
+    if (currentAutocompleteScope === "model") {
+      const cache = modelListCache
+      void cache.promise.then((models) => {
+        if (cache !== modelListCache || currentAutocompleteScope !== "model") return
+        terminal.setSlashCommandItems(modelAutocompleteItems(models))
+      }).catch(() => {})
+    }
+  }
+
+  function syncModelDisplayFromCache(cache = modelListCache): Promise<void> {
+    return cache.promise.then((models) => {
+      if (cache !== modelListCache) return
+      const match = models.find((model) => model.id === input.config.model)
+      terminal.setModel(input.config.model, input.config.modelSettings, match?.name)
+      refreshCurrentSession()
+    }).catch(() => {
+      if (cache !== modelListCache) return
+      terminal.setModel(input.config.model, input.config.modelSettings)
+    })
+  }
+
+  async function openLoginPanel(): Promise<void> {
+    const customProviders = await loadCustomProviders()
+    const allProviders = [...BUILTIN_PROVIDERS, ...customProviders.map(({ apiKey: _, ...def }) => def)]
+    const rows = []
+    for (const def of allProviders) {
+      const keyState = await resolveProviderKeyState(def, customProviders)
+      rows.push({
+        canDelete: keyState.hasSavedKey,
+        id: def.id,
+        displayName: def.displayName,
+        sourceLabel: keyState.sourceLabel,
+        status: def.id === input.config.provider ? "active" as const : keyState.apiKey ? "configured" as const : "unconfigured" as const,
+        protocol: def.protocol,
+      })
+    }
+    terminal.showProviderSelector(
+      rows,
+      (providerId) => showApiKeySetupForProvider(providerId, customProviders),
+      (providerId) => { void useConfiguredProvider(providerId, customProviders) },
+      () => syncPersistentStatusNotice(),
+      (providerId) => { void deleteSavedKey(providerId, customProviders) },
+    )
+  }
+
+  async function resolveProviderKeyState(def: ProviderDefinition, customProviders: Awaited<ReturnType<typeof loadCustomProviders>>): Promise<{ apiKey: string; hasSavedKey: boolean; sourceLabel: string }> {
+    const state = await resolveProviderKey(def, customProviders)
+    const sourceLabel = state.source === "environment"
+      ? state.hasSavedKey ? "env + saved" : "env"
+      : state.source === "saved"
+        ? "saved"
+        : state.source === "custom"
+          ? "custom"
+          : state.hasSavedKey
+            ? "saved unresolved"
+            : state.hasCustomKey
+              ? "custom unresolved"
+              : "not configured"
+    return { apiKey: state.apiKey, hasSavedKey: state.hasSavedKey, sourceLabel }
+  }
+
+  async function useConfiguredProvider(providerId: string, customProviders: Awaited<ReturnType<typeof loadCustomProviders>>): Promise<void> {
+    const def = resolveProvider(providerId, customProviders)
+    if (!def) return
+    const keyState = await resolveProviderKeyState(def, customProviders)
+    if (!keyState.apiKey) {
+      showTransientStatus(`${def.displayName} does not have a usable API key.`, 6000)
+      await openLoginPanel()
+      return
+    }
+    await activateProviderSelection(providerId, def, keyState.apiKey)
+    showTransientStatus(`Provider set to ${def.displayName}. Use /model to pick a model.`, 4000)
+  }
+
+  async function activateProviderSelection(providerId: string, def: ProviderDefinition, apiKey: string): Promise<void> {
+    activateProvider(input.config, def, apiKey)
+    const newModel = def.defaultModel || def.models?.[0]?.id || input.config.model
+    if (newModel !== input.config.model) {
+      input.config.model = newModel
+      input.config.modelSettings = {}
+      terminal.setModel(newModel, {})
+      refreshModelListCache()
+      await saveGlobalPreferences({ provider: providerId, model: newModel, modelSettings: {} }).catch(() => {})
+      return
+    }
+    refreshModelListCache()
+    await saveGlobalPreferences({ provider: providerId }).catch(() => {})
+  }
+
+  function showApiKeySetupForProvider(providerId: string, customProviders: Awaited<ReturnType<typeof loadCustomProviders>>): void {
+    const def = resolveProvider(providerId, customProviders)
+    if (!def) return
+    const label = def.displayName
+    terminal.showApiKeySetup(
+      providerId,
+      label,
+      async (key) => {
+        const normalizedKey = key.trim()
+        if (!normalizedKey) {
+          showTransientStatus(`API key for ${label} cannot be empty.`, 6000)
+          return
+        }
+        try {
+          await setStoredKey(providerId, normalizedKey)
+        } catch (error) {
+          showTransientStatus(`Failed to save API key to ~/.codesh/auth.json: ${formatError(error)}`, 8000)
+          return
+        }
+        await activateProviderSelection(providerId, def, normalizedKey)
+        showTransientStatus(`Provider set to ${label}. API key saved. Use /model to pick a model.`, 4000)
+      },
+      () => { void openLoginPanel() },
+    )
+  }
+
+  async function deleteSavedKey(providerId: string, customProviders: Awaited<ReturnType<typeof loadCustomProviders>>): Promise<void> {
+    const def = resolveProvider(providerId, customProviders)
+    if (!def) return
+    let deleted = false
+    try {
+      deleted = await removeStoredKey(providerId)
+    } catch (error) {
+      showTransientStatus(`Failed to delete saved ${def.displayName} key: ${formatError(error)}`, 8000)
+      return
+    }
+    if (!deleted) {
+      showTransientStatus(`No saved ${def.displayName} key in ~/.codesh/auth.json. Remove env/custom keys from their source.`, 6000)
+      await openLoginPanel()
+      return
+    }
+    if (providerId === input.config.provider) {
+      const next = await resolveProviderKeyState(def, customProviders)
+      activateProvider(input.config, def, next.apiKey)
+      refreshModelListCache()
+    }
+    showTransientStatus(`Deleted saved ${def.displayName} key from ~/.codesh/auth.json.`, 4000)
+    await openLoginPanel()
+  }
+
+  function openPermissionsPanel(): void {
+    const onRemove = (grant: PermissionGrantSummary): void => {
+      permissions.removeGrant(sessionId, grant)
+      terminal.showPermissions(permissions.listSessionGrants(sessionId), onRemove, onClearAll, onClose)
+    }
+    const onClearAll = (): void => {
+      const removed = permissions.clearSession(sessionId)
+      showTransientStatus(removed > 0 ? `Reset ${removed} permission grant${removed === 1 ? "" : "s"} for this conversation.` : "No permission grants to reset for this conversation.")
+      terminal.showPermissions(permissions.listSessionGrants(sessionId), onRemove, onClearAll, onClose)
+    }
+    const onClose = (): void => refreshCurrentSession()
+    terminal.showPermissions(permissions.listSessionGrants(sessionId), onRemove, onClearAll, onClose)
+  }
+
+  function renderTaskDetails(records: TaskRecord[]): void {
+    const status = formatTaskStatusForUser(records)
+    terminal.setTranscript([...displayTranscript(sessionId), { role: "assistant", content: status }])
+  }
+
+  function showTaskStatus(toggle: boolean): void {
+    if (toggle && !taskDetailsView.toggle(sessionId)) {
+      refreshCurrentSession()
+      return
+    }
+    if (!toggle) taskDetailsView.show(sessionId)
+    renderTaskDetails(taskManager.status(sessionId).tasks)
+  }
+
+  function applyBaseAutocompleteItems(items: PromptAutocompleteItem[]): void {
+    baseAutocompleteItems = items
+    if (currentAutocompleteScope === undefined) terminal.setSlashCommandItems(baseAutocompleteItems)
+  }
+
+  function themeAutocompleteItems(): PromptAutocompleteItem[] {
+    return themeChoices.map((choice) => ({
+      browsable: true,
+      description: choice.description,
+      label: choice.displayLabel,
+      value: `/theme ${choice.name}`,
+    }))
+  }
+
+  function modelAutocompleteItems(models: ProviderModel[]): PromptAutocompleteItem[] {
+    return modelsForProvider(models, input.config.provider).map((model) => ({
+      browsable: true,
+      description: [model.providerLabel, model.contextLength ? `${formatTokenCount(model.contextLength)} context` : undefined]
+        .filter(Boolean)
+        .join(" · "),
+      label: model.name || model.id,
+      value: `/model ${model.id}`,
+    }))
+  }
+
+  function resumeAutocompleteItems(
+    sessions: ReturnType<SessionStore["listSessions"]>,
+    commandName: "/history" | "/resume" = "/resume",
+  ): PromptAutocompleteItem[] {
+    return sessions.map((session, index) => {
+      const parentIndex = session.parentSessionId ? sessions.findIndex((candidate) => candidate.id === session.parentSessionId) : -1
+      const pinnedIndex = pinnedChatIds.indexOf(session.id)
+      return {
+        browsable: true,
+        description: `${pinnedIndex >= 0 ? `pinned #${pinnedIndex + 1} · ` : ""}${
+          session.relationType === "fork" && session.parentSessionId
+            ? `${formatRelativeTime(session.updatedAt)} · fork of ${sessionTitleById(input.store, session.parentSessionId)}`
+            : formatRelativeTime(session.updatedAt)
+        }`,
+        label: `${pinnedIndex >= 0 ? `#${pinnedIndex + 1} ` : ""}${session.title}`,
+        relatedValue: parentIndex >= 0 ? `${commandName} ${parentIndex + 1}` : undefined,
+        searchText: cachedResumeConversationSearchText(session),
+        value: `${commandName} ${index + 1}`,
+      }
+    })
+  }
+
+  function cachedResumeConversationSearchText(session: SessionRecord): string {
+    const cached = resumeSearchCache.get(session.id)
+    if (cached?.updatedAt === session.updatedAt) return cached.searchText
+    const searchText = resumeConversationSearchText(input.store, session)
+    resumeSearchCache.set(session.id, { searchText, updatedAt: session.updatedAt })
+    return searchText
+  }
+
+  function forkAutocompleteItems(): PromptAutocompleteItem[] {
+    const current = input.store.getSession(sessionId)
+    const points = input.store.listForkPoints(sessionId)
+    const items: PromptAutocompleteItem[] = []
+    if (hasConversationMessages(input.store.getActivePath(sessionId))) {
+      items.push({
+        browsable: true,
+        description: "Fork through the current active leaf",
+        label: `current · ${current.title}`,
+        value: "/fork current",
+      })
+    }
+    items.push(
+      ...points.map(({ entry, forkCount }) => {
+        const preview = firstLine((entry.data as { content: string }).content)
+        return {
+          browsable: true,
+          description: `${formatRelativeTime(entry.createdAt)}${forkCount > 0 ? ` · ${forkCount} fork${forkCount === 1 ? "" : "s"}` : ""}`,
+          label: preview,
+          value: `/fork ${preview}`,
+        }
+      }),
+    )
+    return items
+  }
+
+  function openResumeSearch(): void {
+    const sessions = input.store.listHistorySessions(input.cwd)
+    if (sessions.length === 0) {
+      showTransientStatus("No saved conversations yet.")
+      return
+    }
+    terminal.setSlashCommandItems(resumeAutocompleteItems(sessions))
+    terminal.showResumeSearch()
+  }
+
+  function resumeSessionByToken(argument: string): void {
+    const sessions = input.store.listHistorySessions(input.cwd)
+    const index = Number.parseInt(argument.trim(), 10)
+    const target = Number.isInteger(index) ? sessions[index - 1] : undefined
+    if (!target) {
+      showTransientStatus(`Unknown conversation: ${argument}`)
+      return
+    }
+    switchToSession(target.id)
+  }
+
+  function switchToSession(targetSessionId: string): void {
+    activateSession(targetSessionId, { clearScreen: targetSessionId !== sessionId })
+  }
+
+  function activateSession(targetSessionId: string, options: { clearDraft?: boolean; clearScreen?: boolean } = {}): void {
+    usageViewState.dismiss()
+    transcriptView.reset()
+    unreadCompletedSessionIds.delete(targetSessionId)
+    terminal.cancelQueuedPromptEdit()
+    taskDetailsView.switchTo(targetSessionId)
+    sessionId = targetSessionId
+    activeDisplaySessionId = targetSessionId
+    if (options.clearScreen) process.stdout.write("\x1b[2J\x1b[H")
+    if (options.clearDraft) terminal.setInputDraft("")
+    terminal.clearTranscriptDisplay()
+    refreshCurrentSession()
+    syncQueuedPrompts()
+    restoreSessionRuntimeUi(targetSessionId)
+    restoreSessionInteractionState(targetSessionId)
+    flushPendingBackgroundPrompts()
+    syncPinnedChats()
+    syncPersistentStatusNotice()
+  }
+
+  function toggleCurrentChatPin(): void {
+    toggleChatPin(sessionId)
+  }
+
+  function togglePinnedChatFromResumeValue(value: string): void {
+    const match = value.match(/^\/(?:resume|history)\s+(\d+)$/)
+    if (!match) return
+    const target = input.store.listHistorySessions(input.cwd)[Number.parseInt(match[1] || "", 10) - 1]
+    if (target) toggleChatPin(target.id)
+  }
+
+  function toggleChatPin(targetSessionId: string): void {
+    const existing = pinnedChatIds.indexOf(targetSessionId)
+    if (existing >= 0) {
+      pinnedChatIds.splice(existing, 1)
+      persistPinnedChats()
+      showTransientStatus("Unpinned chat.")
+      return
+    }
+    if (pinnedChatIds.length >= 5) {
+      showTransientStatus("Five chats are already pinned. Unpin one first.")
+      return
+    }
+    pinnedChatIds.push(targetSessionId)
+    persistPinnedChats()
+    showTransientStatus(`Pinned chat as #${pinnedChatIds.length}. Ctrl+P switches chats.`)
+  }
+
+  function switchToPinnedChat(slot: number): void {
+    const target = pinnedChatIds[slot - 1]
+    if (!target) {
+      showTransientStatus(`No pinned chat at #${slot}.`)
+      return
+    }
+    switchToSession(target)
+  }
+
+  function unpinPinnedChat(slot: number): void {
+    const target = pinnedChatIds[slot - 1]
+    if (!target) return
+    pinnedChatIds = pinnedChatIds.filter((id) => id !== target)
+    persistPinnedChats()
+    showTransientStatus("Unpinned chat.")
+  }
+
+  function showPinnedChatHint(): void {
+    const sessions = new Map(input.store.listHistorySessions(input.cwd).map((candidate) => [candidate.id, candidate]))
+    if (pinnedChatIds.length === 0) {
+      showTransientStatus("No pinned chats. Use /pin in a chat to add one.")
+      return
+    }
+    showTransientStatus(pinnedChatIds.map((id, index) => `#${index + 1} ${sessions.get(id)?.title || "Untitled"}`).join("\n"))
+  }
+
+  function persistPinnedChats(): void {
+    void saveGlobalPreferences({ pinnedChatIds: [...pinnedChatIds] }).catch((error) => {
+      showTransientStatus(`Could not save pinned chats: ${formatError(error)}`)
+    })
+    syncPinnedChats()
+  }
+
+  function syncPinnedChats(): void {
+    const sessions = input.store.listHistorySessions(input.cwd)
+    const byId = new Map(sessions.map((candidate) => [candidate.id, candidate]))
+    const valid = pinnedChatIds.filter((id) => byId.has(id)).slice(0, 5)
+    if (valid.length !== pinnedChatIds.length) {
+      pinnedChatIds = valid
+      void saveGlobalPreferences({ pinnedChatIds: [...valid] }).catch(() => {})
+    }
+    terminal.setPinnedChats(valid.map((id, index) => ({
+      id,
+      slot: index + 1,
+      title: byId.get(id)?.title || "Untitled",
+      working: isSessionRunning(id) || hasActiveSubagentTasks(taskManager.status(id).tasks),
+    })))
+  }
+
+  function restoreSessionRuntimeUi(targetSessionId: string): void {
+    const runtimeUi = runtimeUiFor(sessionRuntimeUi, targetSessionId)
+    terminal.setStreamingContent(runtimeUi.streamingContent)
+    terminal.setToolActivities(runtimeUi.toolActivities)
+    terminal.setThinking(runtimeUi.thinking || isSessionRunning(targetSessionId), runtimeUi.thinkingMessage || "Thinking")
+    terminal.setBusy(isSessionRunning(targetSessionId))
+  }
+
+  function restoreSessionInteractionState(targetSessionId: string): void {
+    terminal.clearInteractionPrompts()
+    const approval = pendingApprovals.get(targetSessionId)
+    if (approval) {
+      terminal.showApprovalPrompt(approval.request, approval.resolve)
+      return
+    }
+    const question = pendingQuestions.get(targetSessionId)
+    if (question) {
+      terminal.showQuestionPrompt(question.request, question.resolve)
+      return
+    }
+    const planAction = pendingPlanActions.get(targetSessionId)
+    if (planAction) terminal.showPlanActions(planAction.planPath, planAction.onSelect)
+  }
+
+  function terminalForSession(targetSessionId: string): CodeshTerminal {
+    return createSessionTerminalBridge({
+      base: terminal,
+      isVisible: () => activeDisplaySessionId === targetSessionId,
+      pendingApprovals,
+      pendingPlanActions,
+      pendingQuestions,
+      runtimeUi: sessionRuntimeUi,
+      targetSessionId,
+    })
+  }
+
+  /**
+   * Apply a model choice, switching the active provider first when the model
+   * belongs to a different (credentialed) provider.
+   */
+  async function applyModelSelection(match: ProviderModel, settings: ModelSettings, opts?: { global?: boolean; persist?: boolean; refresh?: boolean }): Promise<boolean> {
+    const persist = opts?.persist ?? true
+    const refresh = opts?.refresh ?? true
+    if (match.providerId !== input.config.provider) {
+      const customProviders = await loadCustomProviders().catch(() => [] as CustomProvider[])
+      const def = resolveProvider(match.providerId, customProviders)
+      if (!def) {
+        showTransientStatus(`Unknown provider: ${match.providerId}`)
+        return false
+      }
+      const apiKey = (await resolveProviderKey(def, customProviders)).apiKey
+      if (!apiKey) {
+        showTransientStatus(`No API key for ${def.displayName}. Use /login to add one.`)
+        return false
+      }
+      activateProvider(input.config, def, apiKey)
+      if (persist) await saveGlobalPreferences({ provider: def.id }).catch(() => {})
+    }
+    input.config.model = match.id
+    input.config.modelSettings = settings
+    terminal.setModel(match.id, settings, match.name)
+    if (persist) {
+      await (opts?.global
+        ? saveGlobalPreferences({ model: match.id, modelSettings: settings })
+        : saveModelPreferences(input.cwd, { model: match.id, modelSettings: settings })
+      ).catch((error) => {
+        terminal.setTranscript([{ role: "assistant", content: `Failed to save model preference: ${formatError(error)}` }])
+      })
+    }
+    if (refresh) refreshCurrentSession()
+    return true
+  }
+
+  async function setModelByArgument(argument: string): Promise<void> {
+    const isGlobal = argument.trimStart().startsWith("--global ")
+    const trimmed = (isGlobal ? argument.trimStart().slice("--global ".length) : argument).trim()
+    const models = modelsForProvider(await modelListCache.promise, input.config.provider)
+    const lowered = trimmed.toLowerCase()
+    const candidates = [
+      ...models.filter((model) => model.id.toLowerCase() === lowered),
+      ...models.filter((model) => model.name.toLowerCase() === lowered),
+    ]
+    const match = candidates[0]
+    if (!match) {
+      showTransientStatus(`Unknown model: ${trimmed}`)
+      return
+    }
+    const applied = await applyModelSelection(match, {}, { global: isGlobal })
+    if (applied && isGlobal) showTransientStatus(`Model set globally to ${match.name}.`)
+  }
+
+  /** /providers (alias /models): pick a provider, then fuzzy-search its models pi-style, then tune settings. */
+  async function openModelBrowser(): Promise<void> {
+    const models = await modelListCache.promise.catch(() => [] as ProviderModel[])
+    const byProvider = new Map<string, ProviderModel[]>()
+    for (const model of models) {
+      const group = byProvider.get(model.providerId)
+      if (group) group.push(model)
+      else byProvider.set(model.providerId, [model])
+    }
+    if (byProvider.size === 0) {
+      showTransientStatus("No providers with models available. Use /login to add a provider key.")
+      return
+    }
+    const providerItems = [...byProvider.entries()].map(([providerId, group]) => ({
+      value: providerId,
+      label: group[0]?.providerLabel || providerId,
+      description: `${group.length} model${group.length === 1 ? "" : "s"}${providerId === input.config.provider ? " · active" : ""}`,
+    }))
+    terminal.showSelectList("Select a provider", providerItems, (providerId) => {
+      const group = byProvider.get(providerId) || []
+      openModelPicker(group)
+    }, () => {})
+  }
+
+  function openModelPicker(models: ProviderModel[], onCancel?: () => void): void {
+    terminal.showModelSelector(
+      models,
+      input.config.model,
+      (selected) => {
+        const match = models.find((model) => model.id === selected.id && model.providerId === selected.providerId)
+        if (!match) return
+        terminal.showModelEditor(
+          match,
+          match.id === input.config.model ? input.config.modelSettings : {},
+          (_model, settings, done) => {
+            void applyModelSelection(match, settings, { persist: done, refresh: done })
+          },
+          () => {},
+        )
+      },
+      // Esc from a provider's model list goes back to the provider list;
+      // Esc from the all-models picker (/model) just closes.
+      onCancel ?? (() => void openModelBrowser()),
+    )
+  }
+
+  async function handleForkCommand(argument: string): Promise<void> {
+    const activePath = input.store.getActivePath(sessionId)
+    if (activePath.length === 0) {
+      showTransientStatus("Nothing to fork yet.")
+      return
+    }
+    const currentSession = input.store.getSession(sessionId)
+    if (currentSession.relationType === "fork") {
+      showTransientStatus("Forking from a fork is not supported yet. Resume the original conversation to create another level-one fork.", 8000)
+      return
+    }
+    const trimmed = argument.trim()
+    if (!trimmed) {
+      if (input.store.listForkPoints(sessionId).length === 0) {
+        showTransientStatus("No forkable prompts yet. Forking needs an earlier user prompt after at least one assistant response.", 8000)
+        return
+      }
+      terminal.setInputDraft("/fork ")
+      terminal.setSlashCommandItems(forkAutocompleteItems())
+      showTransientStatus("Choose a fork point with arrow keys, then press Enter. Use /fork current to fork the tip.", 6000)
+      return
+    }
+    const isCurrent = ["current", "tip", "head"].includes(trimmed.toLowerCase())
+    const sourceEntryId = isCurrent ? undefined : resolveForkEntryId(input.store, sessionId, trimmed)
+    if (!isCurrent && !sourceEntryId) {
+      showTransientStatus(`Unknown fork point: ${trimmed}. Type /fork and pick a prompt.`)
+      return
+    }
+    try {
+      const result = input.store.forkSession({
+        position: isCurrent ? "at" : "before",
+        sourceEntryId,
+        sourceSessionId: sessionId,
+      })
+      activateSession(result.forkedSession.id, { clearDraft: true })
+      showTransientStatus(`Forked into ${result.forkedSession.title}.`, 6000)
+    } catch (error) {
+      showTransientStatus(formatError(error), 8000)
+    }
+  }
+
+  async function setThemeByName(name: string): Promise<void> {
+    const isGlobal = name.trimStart().startsWith("--global ")
+    const themeName = (isGlobal ? name.trimStart().slice("--global ".length) : name).trim()
+    const choice = findTheme(themeName)
+    if (!choice) {
+      terminal.setTranscript([{ role: "assistant", content: `Unknown theme: ${themeName}\nAvailable themes: ${themeChoices.map((theme) => theme.name).join(", ")}` }])
+      return
+    }
+    input.config.theme = choice.name
+    terminal.setTheme(choice.name)
+    if (isGlobal) {
+      await saveGlobalPreferences({ theme: choice.name })
+      showTransientStatus(`Theme set globally to ${choice.name}.`)
+    } else {
+      await saveThemePreference(input.cwd, choice.name)
+      showTransientStatus(`Theme set to ${choice.name}.`)
+    }
+  }
+
+  async function handleModeCommand(argument: string): Promise<void> {
+    const requested = argument.trim().toLowerCase()
+    if (!requested) {
+      const state = currentPlanModeState(input.store.getActivePath(sessionId))
+      const detail = state.mode === "plan" && state.planPath ? ` (${state.planPath})` : ""
+      showTransientStatus(`Current mode: ${state.mode}${detail}`)
+      return
+    }
+    if (requested !== "agent" && requested !== "plan") {
+      showTransientStatus("Usage: /mode [agent|plan]")
+      return
+    }
+    await switchMode(requested, { reason: "user", seed: requested })
+  }
+
+  async function switchMode(mode: AgentMode, options: { reason: PlanModeEntryData["reason"]; seed?: string }): Promise<void> {
+    clearTransientStatus()
+    const state = transitionPlanMode({
+      cwd: input.cwd,
+      mode,
+      reason: options.reason || "user",
+      seed: options.seed,
+      sessionId,
+      store: input.store,
+    })
+    permissions.setSessionMode(sessionId, state.mode, state.planPath)
+    terminal.setMode(state.mode, state.planPath)
+    if (mode === "agent") terminal.clearPlanActions()
+    showTransientStatus(state.mode === "plan" ? `Plan mode active. Plan artifact: ${state.planPath}` : "Agent mode active.")
+  }
+
+  async function handlePlanAction(action: "execute" | "refine" | "stay", planPath: string): Promise<void> {
+    if (action === "stay") {
+      terminal.clearPlanActions()
+      terminal.setInputDraft("")
+      return
+    }
+    if (action === "refine") {
+      terminal.clearPlanActions()
+      terminal.setInputDraft(`Refine the plan in ${planPath}: `)
+      return
+    }
+
+    terminal.clearPlanActions()
+    await switchMode("agent", { reason: "tool" })
+    await runPromptQueue({
+      hidden: true,
+      source: "plan_execute",
+      text: renderPlanExecutionPrompt(planPath),
+    })
+  }
+
+  async function runSkillCommand(commandName: string, userInstruction: string): Promise<void> {
+    const skillName = commandName.slice("/skill:".length)
+    const skill = skillCatalog.skills.find((candidate) => candidate.name === skillName)
+    if (!skill) {
+      showTransientStatus(`Unknown skill: ${skillName}`)
+      return
+    }
+    clearTransientStatus()
+    await runPromptQueue({
+      hidden: true,
+      source: "skill_invocation",
+      text: renderSkillInvocationMessage(skill, userInstruction),
+    })
+  }
+
+  async function handleSkillsCommand(argument: string): Promise<void> {
+    const [subcommand = "list", ...rest] = argument.trim().split(/\s+/).filter(Boolean)
+    if (subcommand === "reload") {
+      await reloadSkillCatalog()
+      showTransientStatus(`Reloaded ${skillCatalog.skills.length} skill${skillCatalog.skills.length === 1 ? "" : "s"}.`)
+      return
+    }
+    if (subcommand === "view") {
+      const name = rest.join(" ").trim()
+      terminal.setTranscript([...displayTranscript(sessionId), { role: "assistant", content: formatSkillView(skillCatalog.skills, name) }])
+      return
+    }
+    if (subcommand !== "list") {
+      terminal.setTranscript([...displayTranscript(sessionId), { role: "assistant", content: `Unknown /skills command: ${subcommand}\nUsage: /skills [list|view <name>|reload]` }])
+      return
+    }
+    terminal.setTranscript([...displayTranscript(sessionId), { role: "assistant", content: formatSkillsList(skillCatalog.skills) }])
+  }
+
+  async function reloadSkillCatalog(): Promise<void> {
+    skillCatalog = await loadSkills(input.cwd, { extraPaths: input.config.skillPaths })
+    customCommands = await loadCustomCommands(input.cwd)
+    applyBaseAutocompleteItems(slashAutocompleteItems(skillCatalog.skills, customCommands))
+  }
+
+  async function handleImageCommand(argument: string): Promise<void> {
+    if (!argument.trim()) {
+      showTransientStatus("Usage: /image <path|url>")
+      return
+    }
+    const { loadImageAsBase64, parseImageUrl } = await import("./utils/images.js")
+    const path = argument.trim()
+
+    // Check if it's a URL
+    const url = parseImageUrl(path)
+    if (url) {
+      terminal.insertImageAttachment({ type: "url", url }, { displayName: path })
+      showTransientStatus(`Added image from URL: ${path}`)
+      return
+    }
+
+    // Try to load as local file
+    const result = await loadImageAsBase64(path)
+    if (!result.success) {
+      showTransientStatus(`Error loading image: ${result.error}`)
+      return
+    }
+
+    terminal.insertImageAttachment(result.source, { displayName: path, size: result.size })
+    const sizeStr = result.size < 1024 ? `${result.size} B` : result.size < 1024 * 1024 ? `${(result.size / 1024).toFixed(1)} KB` : `${(result.size / (1024 * 1024)).toFixed(1)} MB`
+    showTransientStatus(`Added image: ${path} (${sizeStr})`)
+  }
+
+  async function compactCurrentSession(focus: string): Promise<void> {
+    clearTransientStatus()
+    const compactSessionId = sessionId
+    runningSessionIds.add(compactSessionId)
+    if (sessionId === activeDisplaySessionId) terminal.setBusy(true)
+    terminal.setInputDisabled(true)
+    terminal.setThinking(true, "Compacting context")
+    try {
+      const activePath = input.store.getActivePath(sessionId)
+      const planState = currentPlanModeState(activePath)
+      const systemPrompt = appendResponseModeGuidance(
+        appendPlanModeGuidance(appendSkillGuidance(input.config.systemPrompt, skillCatalog.skills), planState),
+        activeResponseModes,
+      )
+      const result = await compactSessionIfNeeded({
+        config: input.config,
+        cwd: input.cwd,
+        focus: focus.trim() || undefined,
+        force: true,
+        reason: "manual",
+        sessionId: compactSessionId,
+        store: input.store,
+        systemPrompt,
+        tools: toolDefinitions,
+      })
+      if (activeDisplaySessionId === compactSessionId) {
+        terminal.setThinking(false)
+        refreshCurrentSession()
+        const u = estimateContextUsageFor(compactSessionId)
+        terminal.setContextUsage(u.tokens, u.window)
+      }
+      const message = result.entry
+        ? `Compacted context: ${formatTokenCount(result.tokensBefore)} -> ${formatTokenCount(result.tokensAfter || result.tokensBefore)} tokens. File-read state cleared.`
+        : `Compaction skipped: ${formatCompactionSkip(result.skipped)}.`
+      showTransientStatus(message, 6000)
+    } catch (error) {
+      showTransientStatus(`Compaction failed: ${formatError(error)}`, 6000)
+    } finally {
+      if (activeDisplaySessionId === compactSessionId) terminal.setThinking(false)
+      terminal.setInputDisabled(false)
+      if (activeDisplaySessionId === compactSessionId) terminal.setBusy(false)
+      runningSessionIds.delete(compactSessionId)
+    }
+  }
+
+  function clearTransientStatus(): void {
+    transientStatusToken += 1
+    if (transientStatusTimer) {
+      clearTimeout(transientStatusTimer)
+      transientStatusTimer = undefined
+    }
+    syncPersistentStatusNotice()
+  }
+
+  function showStatusSummary(): void {
+    const session = input.store.getSession(sessionId)
+    const activePath = input.store.getActivePath(sessionId)
+    const state = currentPlanModeState(activePath)
+    const usage = estimateContextUsage()
+    const grantCount = permissions.listSessionGrants(sessionId).length
+    const lines = [
+      `Session:  ${session.id}`,
+      `Title:    ${session.title}`,
+      `Cwd:      ${input.cwd}`,
+      `Model:    ${input.config.model}`,
+      `Mode:     ${state.mode}`,
+      `Context:  ${formatTokenCompact(usage.tokens)} / ${formatTokenCompact(usage.window)}`,
+      `Theme:    ${resolveTheme(input.config.theme).name}`,
+      `Grants:   ${grantCount} permission grant${grantCount === 1 ? "" : "s"}`,
+    ]
+    terminal.setTranscript([...entriesToTranscript(activePath), { role: "assistant", content: lines.join("\n") }])
+  }
+
+  async function exportConversation(argument: string): Promise<void> {
+    const args = argument.trim().toLowerCase().split(/\s+/)
+    const isJson = args.includes("json")
+    const pathArg = args.find((a) => a !== "json" && a.length > 0)
+    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19)
+    const defaultPath = resolve(input.cwd, `codesh-export-${timestamp}.${isJson ? "json" : "md"}`)
+    const outPath = pathArg ? resolve(input.cwd, pathArg) : defaultPath
+    const activePath = input.store.getActivePath(sessionId)
+    const session = input.store.getSession(sessionId)
+    const transcript = entriesToTranscript(activePath)
+    let content: string
+    if (isJson) {
+      content = JSON.stringify({ sessionId, title: session.title, messages: transcript }, null, 2) + "\n"
+    } else {
+      const lines = [`# ${session.title}`, ""]
+      for (const msg of transcript) {
+        const text = Array.isArray(msg.content)
+          ? msg.content.filter((b) => b.type === "text").map((b) => (b as { type: "text"; text: string }).text).join("") + (msg.content.some((b) => b.type === "image_url") ? "\n[image attachment]" : "")
+          : msg.content
+        lines.push(`### ${msg.role === "user" ? "You" : "Codesh"}`, "", text, "")
+      }
+      content = lines.join("\n")
+    }
+    try {
+      await writeFile(outPath, content, "utf8")
+      showTransientStatus(`Exported to ${outPath}`, 5000)
+    } catch (error) {
+      showTransientStatus(`Export failed: ${formatError(error)}`)
+    }
+  }
+
+  async function showSessionDiff(): Promise<void> {
+    const activePath = input.store.getActivePath(sessionId)
+    const writeCalls = activePath.filter(
+      (entry) => entry.type === "tool_call" &&
+        ["write", "edit"].includes((entry.data as { name: string }).name) &&
+        (entry.data as { fileSnapshot?: { path: string; existed: boolean; previousContent?: string } }).fileSnapshot,
+    )
+    if (writeCalls.length === 0) {
+      terminal.setTranscript([...entriesToTranscript(activePath), { role: "assistant", content: "No file changes this session." }])
+      return
+    }
+    // Group by path, keeping earliest snapshot per path (pre-session state)
+    const earliest = new Map<string, { path: string; existed: boolean; previousContent?: string }>()
+    for (const entry of writeCalls) {
+      const snap = (entry.data as { fileSnapshot: { path: string; existed: boolean; previousContent?: string } }).fileSnapshot
+      if (!earliest.has(snap.path)) earliest.set(snap.path, snap)
+    }
+    const patches: string[] = []
+    for (const [filePath, snap] of earliest) {
+      const absPath = resolve(input.cwd, filePath)
+      let current = ""
+      try { current = readFileSync(absPath, "utf8") } catch { /* file deleted */ }
+      const prev = snap.previousContent ?? ""
+      if (prev === current) continue
+      patches.push(simpleDiff(filePath, prev, current))
+    }
+    const output = patches.length > 0 ? patches.join("\n") : "No uncommitted changes for tracked files."
+    terminal.setTranscript([...entriesToTranscript(activePath), { role: "assistant", content: output }])
+  }
+
+  async function syncSidebarModifiedFiles(): Promise<void> {
+    const activePath = input.store.getActivePath(sessionId)
+    const writeCalls = activePath.filter(
+      (entry) => entry.type === "tool_call" &&
+        ["write", "edit"].includes((entry.data as { name: string }).name) &&
+        (entry.data as { fileSnapshot?: { path: string; existed: boolean; previousContent?: string } }).fileSnapshot,
+    )
+    const earliest = new Map<string, { path: string; existed: boolean; previousContent?: string }>()
+    for (const entry of writeCalls) {
+      const snap = (entry.data as { fileSnapshot: { path: string; existed: boolean; previousContent?: string } }).fileSnapshot
+      if (!earliest.has(snap.path)) earliest.set(snap.path, snap)
+    }
+    for (const [filePath, snap] of earliest) {
+      const absPath = resolve(input.cwd, filePath)
+      let current = ""
+      try { current = readFileSync(absPath, "utf8") } catch { /* file deleted */ }
+      const prev = snap.previousContent ?? ""
+      if (prev === current) {
+        terminal.setModifiedFile?.(filePath, 0, 0)
+        continue
+      }
+      const stats = computeDiffStats(prev, current)
+      terminal.setModifiedFile?.(filePath, stats.additions, stats.removals)
+    }
+  }
+
+  async function undoLastFileChange(): Promise<void> {
+    const activePath = input.store.getActivePath(sessionId)
+    // Find undone entries
+    const undoneToolIds = new Set(
+      activePath
+        .filter((e) => e.type === "custom" && (e.data as { kind?: string }).kind === "undo")
+        .map((e) => (e.data as { toolCallId: string }).toolCallId),
+    )
+    // Find last non-undone write/edit with a snapshot
+    const candidate = [...activePath].reverse().find(
+      (entry) =>
+        entry.type === "tool_call" &&
+        ["write", "edit"].includes((entry.data as { name: string }).name) &&
+        (entry.data as { fileSnapshot?: unknown }).fileSnapshot &&
+        !undoneToolIds.has((entry.data as { toolCallId: string }).toolCallId),
+    )
+    if (!candidate) {
+      showTransientStatus("Nothing to undo.")
+      return
+    }
+    const snap = (candidate.data as { fileSnapshot: { path: string; existed: boolean; previousContent?: string } }).fileSnapshot
+    const absPath = resolve(input.cwd, snap.path)
+    try {
+      if (snap.existed && snap.previousContent !== undefined) {
+        writeFileSync(absPath, snap.previousContent, "utf8")
+      } else {
+        try { unlinkSync(absPath) } catch { /* already gone */ }
+      }
+      const toolCallId = (candidate.data as { toolCallId: string }).toolCallId
+      input.store.appendEntry(sessionId, "custom", null, { kind: "undo", toolCallId })
+      removeAcceptedLines(toolCallId)
+      showTransientStatus(`Undid: ${snap.path}`)
+    } catch (error) {
+      showTransientStatus(`Undo failed: ${formatError(error)}`)
+    }
+  }
+
+  async function showCostSummary(): Promise<void> {
+    const activePath = input.store.getActivePath(sessionId)
+    const session = summarizeUsageCosts(activePath)
+    const lifetime = readKeyUsage(input.config.provider, input.config.apiKey)
+    const fmtTokens = (p: number, c: number): string => `${formatTokenCompact(p)} prompt + ${formatTokenCompact(c)} completion = ${formatTokenCompact(p + c)} tokens`
+    const fmtUnknown = (unknown: number): string => unknown > 0 ? ` (${unknown} turn${unknown === 1 ? "" : "s"} with unknown cost)` : ""
+    const providerLines = session.byProvider.length === 0
+      ? ["Providers: none yet"]
+      : [
+        "Providers:",
+        ...session.byProvider.map((provider) => `- ${provider.provider}: ${formatCostUsd(provider.costUsd)} · ${fmtTokens(provider.promptTokens, provider.completionTokens)}${fmtUnknown(provider.unknownCostTurns)}`),
+      ]
+    const lines = [
+      `Session:  ${formatCostUsd(session.costUsd)} · ${fmtTokens(session.promptTokens, session.completionTokens)}${fmtUnknown(session.unknownCostTurns)}`,
+      `Cache:    ${formatTokenCompact(session.cacheReadTokens)} read + ${formatTokenCompact(session.cacheWriteTokens)} written tokens reported by provider`,
+      `Key total: ${formatCostUsd(lifetime.costUsd)} · ${fmtTokens(lifetime.promptTokens, lifetime.completionTokens)}${fmtUnknown(lifetime.unknownCostTurns)}`,
+      "",
+      ...providerLines,
+    ]
+    terminal.setTranscript([...entriesToTranscript(activePath), { role: "assistant", content: lines.join("\n") }])
+  }
+
+  function showUsageSummary(): void {
+    const yearAgo = Date.now() - 365 * 24 * 60 * 60 * 1000
+    const total = readKeyUsage(input.config.provider, input.config.apiKey)
+    const activity = readKeyUsage(input.config.provider, input.config.apiKey, yearAgo)
+    const report = renderUsageReport({
+      ...total,
+      acceptedLines: activity.acceptedLines,
+      completionTokens: activity.completionTokens,
+      days: activity.days,
+      promptTokens: activity.promptTokens,
+    })
+    usageViewState.show()
+    terminal.setTranscript([
+      ...displayTranscript(sessionId),
+      { role: "assistant", content: report },
+    ])
+  }
+
+  function enqueuePrompt(text: string, options: { hidden?: boolean; images?: ImageAttachment[]; source?: string } = {}): QueuedPrompt {
+    const queued = promptQueues.enqueue(sessionId, text, options)
+    syncQueuedPrompts()
+    return queued
+  }
+
+  function beginQueuedPromptEdit(id: string): QueuedPrompt | undefined {
+    const queue = promptQueue()
+    const index = queue.findIndex((prompt) => prompt.id === id)
+    if (index < 0) return undefined
+    queuedPromptEditPositions.set(id, index)
+    return removeQueuedPrompt(id)
+  }
+
+  function restoreEditedQueuedPrompt(prompt: QueuedPrompt): void {
+    const index = queuedPromptEditPositions.get(prompt.id) ?? promptQueue().length
+    queuedPromptEditPositions.delete(prompt.id)
+    promptQueues.insert(sessionId, prompt, index)
+    syncQueuedPrompts()
+  }
+
+  function deleteEditedQueuedPrompt(prompt: QueuedPrompt): void {
+    queuedPromptEditPositions.delete(prompt.id)
+    syncQueuedPrompts()
+  }
+
+  function saveEditedQueuedPrompt(prompt: QueuedPrompt, sendNow: boolean, resumeQueue = true): void {
+    const index = queuedPromptEditPositions.get(prompt.id) ?? promptQueue().length
+    queuedPromptEditPositions.delete(prompt.id)
+    promptQueues.insert(sessionId, prompt, index)
+    syncQueuedPrompts()
+    if (sendNow) {
+      promoteQueuedPrompt(prompt.id)
+      return
+    }
+    if (resumeQueue) startNextQueuedPromptIfIdle()
+  }
+
+  function removeQueuedPrompt(id: string): QueuedPrompt | undefined {
+    const removed = promptQueues.remove(sessionId, id)
+    syncQueuedPrompts()
+    return removed
+  }
+
+  function promoteQueuedPrompt(id: string): void {
+    const prompt = promptQueues.promote(sessionId, id)
+    if (!prompt) return
+    promptQueues.resume(sessionId)
+    syncQueuedPrompts()
+    if (isCurrentSessionRunning()) {
+      interruptCurrentTurn(false)
+      return
+    }
+    promptQueues.remove(sessionId, prompt.id)
+    syncQueuedPrompts()
+    const promotedSessionId = sessionId
+    void runPromptQueue(prompt).catch((error) => {
+      if (activeDisplaySessionId !== promotedSessionId) return
+      terminal.setTranscript([...displayTranscript(promotedSessionId), { role: "assistant", content: formatError(error) }])
+    })
+  }
+
+  function startNextQueuedPromptIfIdle(): void {
+    if (isCurrentSessionRunning()) return
+    promptQueues.resume(sessionId)
+    const queue = promptQueue()
+    const next = queue.shift()
+    syncQueuedPrompts()
+    if (!next) return
+    const queuedSessionId = sessionId
+    void runPromptQueue(next).catch((error) => {
+      if (activeDisplaySessionId !== queuedSessionId) return
+      terminal.setTranscript([...displayTranscript(queuedSessionId), { role: "assistant", content: formatError(error) }])
+    })
+  }
+
+  function interruptCurrentTurn(haltQueue: boolean): void {
+    if (haltQueue) promptQueues.pause(sessionId)
+    const controller = currentAbortController()
+    if (!controller || controller.signal.aborted) return
+    controller.abort()
+  }
+
+  function syncQueuedPrompts(targetSessionId = sessionId): void {
+    if (targetSessionId !== activeDisplaySessionId) return
+    terminal.setQueuedPrompts(promptQueue(targetSessionId).filter((prompt) => !prompt.hidden))
+  }
+
+  function refreshCurrentSession(): void {
+    refreshInteractive(terminal, input.store, sessionId, displayTranscript(sessionId))
+    const state = currentPlanModeState(input.store.getActivePath(sessionId))
+    permissions.setSessionMode(sessionId, state.mode, state.planPath)
+    terminal.setMode(state.mode, state.planPath)
+    if (state.mode !== "plan") terminal.clearPlanActions()
+    const usage = estimateContextUsage()
+    terminal.setContextUsage(usage.tokens, usage.window)
+    updateTerminalCostUsage(terminal, input.store, sessionId, input.config)
+    terminal.setTaskStatus(taskManager.status(sessionId))
+    syncPinnedChats()
+  }
+
+  function displayTranscript(targetSessionId: string): ReturnType<typeof entriesToTranscript> {
+    const activePath = input.store.getActivePath(targetSessionId)
+    return entriesToTranscript(transcriptView.visibleEntries(targetSessionId, activePath))
+  }
+
+  function estimateContextUsage(): { tokens: number; window: number } {
+    return estimateContextUsageFor(sessionId)
+  }
+
+  function estimateContextUsageFor(targetSessionId: string): { tokens: number; window: number } {
+    const systemPrompt = appendResponseModeGuidance(
+      appendPlanModeGuidance(appendSkillGuidance(input.config.systemPrompt, skillCatalog.skills), currentPlanModeState(input.store.getActivePath(targetSessionId))),
+      activeResponseModes,
+    )
+    const messages = entriesToModelMessages(systemPrompt, input.store.getActivePath(targetSessionId), { cwd: input.cwd })
+    const tokens = estimateRequestTokens(messages, toolDefinitions)
+    return { tokens, window: effectiveContextWindow(input.config, modelListCache.models) }
+  }
+
+  async function enqueueOrRunSyntheticPrompt(text: string): Promise<void> {
+    if (isCurrentSessionRunning() || promptQueues.isPaused(sessionId)) {
+      enqueuePrompt(text, { hidden: true, source: "background_subagent_completion" })
+      return
+    }
+    await runPromptQueue({ hidden: true, source: "background_subagent_completion", text })
+  }
+
+  function promptQueue(targetSessionId = sessionId): QueuedPrompt[] {
+    return promptQueues.get(targetSessionId)
+  }
+
+  function flushPendingBackgroundPrompts(): void {
+    const prompts = pendingBackgroundPrompts.get(sessionId)
+    if (!prompts || prompts.length === 0) return
+    pendingBackgroundPrompts.delete(sessionId)
+    for (const prompt of prompts) enqueuePrompt(prompt, { hidden: true, source: "background_subagent_completion" })
+    const queue = promptQueue()
+    if (!isCurrentSessionRunning() && !promptQueues.isPaused(sessionId) && queue.length > 0) {
+      const next = queue.shift()
+      syncQueuedPrompts()
+      if (next) void runPromptQueue(next).catch((error) => {
+        terminal.setTranscript([...displayTranscript(sessionId), { role: "assistant", content: formatError(error) }])
+      })
+    }
+  }
+
+  async function runPromptQueue(firstPrompt: PromptQueueInput, submittedImages?: ImageAttachment[]): Promise<void> {
+    const targetSessionId = sessionId
+    const queue = promptQueue(targetSessionId)
+    promptQueues.unshiftActive(targetSessionId, firstPrompt, submittedImages)
+    syncQueuedPrompts(targetSessionId)
+    if (isSessionRunning(targetSessionId)) return
+
+    runningSessionIds.add(targetSessionId)
+    syncPinnedChats()
+    if (targetSessionId === activeDisplaySessionId) terminal.setBusy(true)
+    try {
+      while (queue.length > 0) {
+        const next = queue.shift()
+        syncQueuedPrompts(targetSessionId)
+        if (!next) continue
+        const controller = new AbortController()
+        activeAbortControllers.set(targetSessionId, controller)
+        const turnSessionId = targetSessionId
+        let completed = false
+        try {
+          await runSingleTurn({
+            config: input.config,
+            contextWindow: effectiveContextWindow(input.config, modelListCache.models),
+            cwd: input.cwd,
+            displayTranscript: () => displayTranscript(turnSessionId),
+            hiddenUserMessage: next.hidden,
+            hiddenUserMessageSource: next.hidden ? next.source || "hidden_prompt" : undefined,
+            images: next.images,
+            permissions,
+            prompt: next.text,
+            responseModes: responseModeNames.filter((mode) => activeResponseModes.has(mode)),
+            sessionId: turnSessionId,
+            signal: controller.signal,
+            onPlanReady: (planPath) => {
+              terminalForSession(turnSessionId).showPlanActions(planPath, (action) => {
+                void handlePlanAction(action, planPath).catch((error) => showTransientStatus(formatError(error)))
+              })
+            },
+            store: input.store,
+            taskRunner: taskManager,
+            terminal: terminalForSession(turnSessionId),
+          })
+          completed = true
+        } catch (error) {
+          if (!isAbortError(error)) throw error
+          closeInterruptedToolCalls(input.store, turnSessionId)
+          input.store.appendMessage(turnSessionId, "assistant", INTERRUPTED_MESSAGE, input.config.model)
+          if (activeDisplaySessionId === turnSessionId) {
+            terminal.setThinking(false)
+            terminal.setTranscript(displayTranscript(turnSessionId))
+          }
+        } finally {
+          if (completed && !next.hidden) {
+            if (activeDisplaySessionId === turnSessionId) unreadCompletedSessionIds.delete(turnSessionId)
+            else unreadCompletedSessionIds.add(turnSessionId)
+          }
+          if (activeAbortControllers.get(turnSessionId) === controller) activeAbortControllers.delete(turnSessionId)
+          if (activeDisplaySessionId === turnSessionId) {
+            const usage = estimateContextUsageFor(turnSessionId)
+            terminal.setContextUsage(usage.tokens, usage.window)
+            updateTerminalCostUsage(terminal, input.store, turnSessionId, input.config)
+          }
+        }
+        if (promptQueues.isPaused(targetSessionId)) break
+      }
+    } finally {
+      runningSessionIds.delete(targetSessionId)
+      syncPinnedChats()
+      activeAbortControllers.delete(targetSessionId)
+      if (targetSessionId === activeDisplaySessionId) {
+        terminal.setBusy(false)
+        terminal.setThinking(false)
+      }
+      if (input.config.notifications) process.stdout.write("\x07")
+      syncQueuedPrompts(targetSessionId)
+    }
+  }
+}
+
+function resumeConversationSearchText(store: SessionStore, session: SessionRecord): string {
+  const entryText = store.getActivePath(session.id).map((entry) => {
+    if (entry.type === "message") {
+      const data = entry.data as MessageEntryData
+      return `${entry.role ?? "message"} ${data.content}`
+    }
+    if (entry.type === "tool_call") {
+      const data = entry.data as ToolCallEntryData
+      return `tool ${data.name} ${data.arguments} ${data.content ?? ""}`
+    }
+    if (entry.type === "tool_result") {
+      const data = entry.data as ToolResultEntryData
+      return `tool result ${data.name} ${data.content}`
+    }
+    if (entry.type === "compaction") {
+      const data = entry.data as CompactionEntryData
+      return `compaction ${data.focus ?? ""} ${data.summary}`
+    }
+    try {
+      return JSON.stringify(entry.data, (key, value) => {
+        if (key === "images" || key === "previousContent" || key === "data") return undefined
+        return value
+      })
+    } catch {
+      return ""
+    }
+  })
+  return [session.id, session.title, ...entryText].join("\n")
+}
+
+function clearTerminalViewportAndScrollback(): void {
+  // 2J clears the visible viewport, 3J clears terminal scrollback in terminals
+  // that support xterm's extension, and H returns the cursor to the top-left.
+  // This prevents `npm run dev` / shell output from remaining above the first
+  // Codesh render while preserving `--no-clear` for users who want it.
+  process.stdout.write("\x1b[2J\x1b[3J\x1b[H")
+}
+
+function refreshInteractive(
+  terminal: CodeshTerminal,
+  store: SessionStore,
+  sessionId: string,
+  visibleTranscript?: ReturnType<typeof entriesToTranscript>,
+): void {
+  const session = store.getSession(sessionId)
+  const activePath = store.getActivePath(sessionId)
+  const transcript = visibleTranscript ?? entriesToTranscript(activePath)
+  const forkParentTitle = session.relationType === "fork" && session.parentSessionId ? sessionTitleById(store, session.parentSessionId) : undefined
+  terminal.setSessionMeta({ forkParentTitle, title: session.title })
+  terminal.clearToolActivities()
+  terminal.setTranscript(transcript)
+}
+
+async function visibleAssistantTextForMode(cwd: string, assistantText: string, state: { mode: AgentMode; planPath?: string }): Promise<string> {
+  if (state.mode !== "plan" || !state.planPath) return assistantText
+  try {
+    const content = await readFile(resolve(cwd, state.planPath), "utf8")
+    return renderVisiblePlanArtifact(assistantText, state.planPath, content)
+  } catch {
+    return assistantText
+  }
+}
+
+export async function runPiped(input: {
+  config: Awaited<ReturnType<typeof loadConfig>>
+  sessionId: string
+  store: SessionStore
+}): Promise<void> {
+  const rl = readline.createInterface({ input: process.stdin })
+  let sessionId = input.sessionId
+  const permissions = new SessionPermissionStore()
+
+  for await (const line of rl) {
+    const prompt = line.trim()
+    if (!prompt) continue
+    const command = parseSlashCommand(prompt)
+    if (command.name === "/exit" || command.name === "/quit") break
+    if (command.name === "/new") {
+      const session = input.store.getSession(sessionId)
+      sessionId = session.activeLeafId ? input.store.createSession({ cwd: process.cwd(), title: "New Chat" }).id : session.id
+      continue
+    }
+    if (command.name === "/plan") {
+      const state = transitionPlanMode({ cwd: process.cwd(), mode: "plan", reason: "user", seed: command.argument, sessionId, store: input.store })
+      permissions.setSessionMode(sessionId, state.mode, state.planPath)
+      process.stdout.write(`Plan mode active. Plan artifact: ${state.planPath}\n`)
+      if (command.argument) {
+        await runSingleTurn({ config: input.config, cwd: process.cwd(), permissions, prompt: command.argument, sessionId, store: input.store })
+      }
+      continue
+    }
+    if (command.name === "/agent") {
+      const state = transitionPlanMode({ cwd: process.cwd(), mode: "agent", reason: "user", sessionId, store: input.store })
+      permissions.setSessionMode(sessionId, state.mode)
+      process.stdout.write("Agent mode active.\n")
+      continue
+    }
+    if (command.name === "/mode") {
+      const requested = command.argument.trim().toLowerCase()
+      if (!requested) {
+        const state = currentPlanModeState(input.store.getActivePath(sessionId))
+        process.stdout.write(`Current mode: ${state.mode}${state.mode === "plan" && state.planPath ? ` (${state.planPath})` : ""}\n`)
+        continue
+      }
+      if (requested === "agent") {
+        const state = transitionPlanMode({ cwd: process.cwd(), mode: "agent", reason: "user", sessionId, store: input.store })
+        permissions.setSessionMode(sessionId, state.mode)
+        process.stdout.write("Agent mode active.\n")
+        continue
+      }
+      if (requested === "plan") {
+        const state = transitionPlanMode({ cwd: process.cwd(), mode: "plan", reason: "user", sessionId, store: input.store })
+        permissions.setSessionMode(sessionId, state.mode, state.planPath)
+        process.stdout.write(`Plan mode active. Plan artifact: ${state.planPath}\n`)
+        continue
+      }
+      process.stdout.write("Usage: /mode [agent|plan]\n")
+      continue
+    }
+    if (command.name === "/permissions") {
+      const removed = permissions.clearSession(sessionId)
+      process.stdout.write(removed > 0 ? `Reset ${removed} permission grant${removed === 1 ? "" : "s"} for this conversation.\n` : "No permission grants to reset for this conversation.\n")
+      continue
+    }
+    if (isHistoryCommand(command.name)) {
+      process.stdout.write(`${formatHistoryOverview(input.store, process.cwd()).join("\n")}\n`)
+      continue
+    }
+    if (command.name === "/fork" || command.name === "/clone") {
+      const arg = command.name === "/clone" ? "current" : command.argument.trim()
+      if (!arg) {
+        const points = input.store.listForkPoints(sessionId)
+        if (hasConversationMessages(input.store.getActivePath(sessionId))) process.stdout.write(`current - ${input.store.getSession(sessionId).title}\n`)
+        for (const { entry, forkCount } of points) {
+          process.stdout.write(`${firstLine(entry.data.content)} - ${formatRelativeTime(entry.createdAt)}${forkCount > 0 ? ` - ${forkCount} fork${forkCount === 1 ? "" : "s"}` : ""}\n`)
+        }
+        process.stdout.write("Use /fork current or /fork <prompt preview>.\n")
+        continue
+      }
+      const isCurrent = ["current", "tip", "head"].includes(arg.toLowerCase())
+      const sourceEntryId = isCurrent ? undefined : resolveForkEntryId(input.store, sessionId, arg)
+      if (!isCurrent && !sourceEntryId) {
+        process.stdout.write(`Unknown fork point: ${arg}\n`)
+        continue
+      }
+      const result = input.store.forkSession({ position: isCurrent ? "at" : "before", sourceEntryId, sourceSessionId: sessionId })
+      sessionId = result.forkedSession.id
+      process.stdout.write(`Forked: ${result.forkedSession.title}\n`)
+      continue
+    }
+    if (command.name === "/model") {
+      process.stdout.write(`${input.config.model}\n`)
+      continue
+    }
+    if (command.name === "/skills") {
+      const catalog = await loadSkills(process.cwd(), { extraPaths: input.config.skillPaths })
+      const [subcommand = "list", ...rest] = command.argument.trim().split(/\s+/).filter(Boolean)
+      if (subcommand === "reload") {
+        process.stdout.write(`Reloaded ${catalog.skills.length} skill${catalog.skills.length === 1 ? "" : "s"}.\n`)
+        continue
+      }
+      if (subcommand === "view") {
+        process.stdout.write(`${formatSkillView(catalog.skills, rest.join(" ").trim())}\n`)
+        continue
+      }
+      process.stdout.write(`${formatSkillsList(catalog.skills)}\n`)
+      continue
+    }
+    if (command.name === "/compact") {
+      const catalog = await loadSkills(process.cwd(), { extraPaths: input.config.skillPaths })
+      const activePath = input.store.getActivePath(sessionId)
+      const planState = currentPlanModeState(activePath)
+      const systemPrompt = appendResponseModeGuidance(
+        appendPlanModeGuidance(appendSkillGuidance(input.config.systemPrompt, catalog.skills), planState),
+        [],
+      )
+      const result = await compactSessionIfNeeded({
+        config: input.config,
+        cwd: process.cwd(),
+        focus: command.argument.trim() || undefined,
+        force: true,
+        reason: "manual",
+        sessionId,
+        store: input.store,
+        systemPrompt,
+        tools: toolDefinitions,
+      })
+      process.stdout.write(
+        result.entry
+          ? `Compacted context: ${formatTokenCount(result.tokensBefore)} -> ${formatTokenCount(result.tokensAfter || result.tokensBefore)} tokens. File-read state cleared.\n`
+          : `Compaction skipped: ${formatCompactionSkip(result.skipped)}.\n`,
+      )
+      continue
+    }
+    if (command.name === "/theme") {
+      if (!command.argument) {
+        process.stdout.write(`${resolveTheme(input.config.theme).name}\n`)
+        for (const choice of themeChoices) process.stdout.write(`${choice.name} - ${choice.description}\n`)
+        continue
+      }
+      const choice = findTheme(command.argument)
+      if (!choice) {
+        process.stdout.write(`Unknown theme: ${command.argument}\nAvailable themes: ${themeChoices.map((theme) => theme.name).join(", ")}\n`)
+        continue
+      }
+      input.config.theme = choice.name
+      await saveThemePreference(process.cwd(), choice.name)
+      process.stdout.write(`${choice.name}\n`)
+      continue
+    }
+    if (command.name === "/lofi" || command.name === "/snow" || command.name === "/stfu" || command.name === "/caveman") {
+      process.stdout.write(`${command.name} mode is only available in the interactive TUI.\n`)
+      continue
+    }
+    if (command.name === "/evolve" || command.name === "/evolve-merge") {
+      process.stdout.write(`${command.name} is only available in the interactive TUI (it needs agent and review prompts).\n`)
+      continue
+    }
+    if (command.name === "/reset") {
+      process.stdout.write("/reset is only available in the interactive TUI (it needs a confirmation step).\n")
+      continue
+    }
+    if (command.name === "/settings" || command.name === "/prefs") {
+      const statusLine = input.config.statusLine
+      const statusContext =
+        statusLine.statusContextMode === "off" || statusLine.statusShowContext === false
+          ? "off"
+          : statusLine.statusContextMode === "percent"
+            ? "percent only"
+            : statusLine.statusContextMode === "tokens-percent" || statusLine.statusShowContextPercent === true
+              ? "percent"
+              : "on"
+      process.stdout.write(
+        `layout=${input.config.layout}\n` +
+          `typingIndicator=${input.config.typingIndicator ?? "block"}\n` +
+          `typingIndicatorBlink=${input.config.typingIndicatorBlink === true}\n` +
+          `notifications=${input.config.notifications === true}\n` +
+          `statusAppName=${statusLine.statusShowAppName !== false}\n` +
+          `statusCwd=${statusLine.statusShowCwd !== false}\n` +
+          `statusTitle=${statusLine.statusShowTitle !== false}\n` +
+          `statusContext=${statusContext}\n` +
+          `statusCost=${statusLine.statusShowCost !== false}\n` +
+          `statusMode=${statusLine.statusShowMode !== false}\n` +
+          `statusWindow=${statusLine.statusShowWindow !== false}\n` +
+          `statusTheme=${statusLine.statusShowTheme !== false}\n` +
+          `statusModel=${statusLine.statusShowModel !== false}\n` +
+          `statusReasoning=${statusLine.statusShowReasoning !== false}\n` +
+          `statusFast=${statusLine.statusShowFast !== false}\n` +
+          `statusForkParent=${statusLine.statusShowForkParent !== false}\n`,
+      )
+      continue
+    }
+    if (isSkillCommand(command.name)) {
+      const skillName = command.name.slice("/skill:".length)
+      const skill = await loadSkillByName(process.cwd(), skillName, { extraPaths: input.config.skillPaths })
+      if (!skill) {
+        process.stdout.write(`Unknown skill: ${skillName}\n`)
+        continue
+      }
+      await runSingleTurn({
+        config: input.config,
+        cwd: process.cwd(),
+        hiddenUserMessage: true,
+        hiddenUserMessageSource: "skill_invocation",
+        permissions,
+        prompt: renderSkillInvocationMessage(skill, command.argument),
+        sessionId,
+        store: input.store,
+      })
+      continue
+    }
+    await runSingleTurn({ config: input.config, cwd: process.cwd(), permissions, prompt, sessionId, store: input.store })
+  }
+}
+
+export async function runSingleTurn(input: {
+  config: Awaited<ReturnType<typeof loadConfig>>
+  contextWindow?: number
+  cwd: string
+  displayTranscript?: () => ReturnType<typeof entriesToTranscript>
+  hiddenUserMessage?: boolean
+  hiddenUserMessageSource?: string
+  images?: ImageAttachment[]
+  outputFormat?: "text" | "json"
+  permissions?: SessionPermissionStore
+  prompt: string
+  responseModes?: ResponseMode[]
+  sessionId: string
+  signal?: AbortSignal
+  skipTitle?: boolean
+  onPlanReady?: (planPath: string) => void
+  store: SessionStore
+  taskRunner?: TaskManager
+  terminal?: CodeshTerminal
+}): Promise<void> {
+  const permissions = input.permissions || new SessionPermissionStore()
+  const taskRunner: TaskManager =
+    input.taskRunner ||
+    createSubagentTaskManager({
+      cwd: input.cwd,
+      executeChildTask: (record, signal, manager) => runSubagentTask({ config: input.config, cwd: input.cwd, permissions, record, signal, store: input.store, taskManager: manager, terminal: input.terminal }),
+      permissions,
+      store: input.store,
+    })
+
+  const referencedImages = (input.images ?? []).filter((img) => {
+    if (!img.label || !input.prompt.includes(`[Image #${img.label}]`)) return false
+    if (img.source.type === "base64" && !img.source.data) return false
+    return true
+  })
+  input.store.appendMessage(input.sessionId, "user", input.prompt, {
+    ...(input.hiddenUserMessage ? { hidden: true, source: input.hiddenUserMessageSource || "hidden_prompt" } : {}),
+    ...(referencedImages.length > 0 ? { images: referencedImages } : {}),
+  })
+
+  if (input.terminal) {
+    input.terminal.clearToolActivities()
+    input.terminal.setTranscript(input.displayTranscript?.() ?? entriesToTranscript(input.store.getActivePath(input.sessionId)))
+    input.terminal.setThinking(true, "Thinking")
+  }
+  if (!input.hiddenUserMessage && !input.skipTitle) await maybeTitleSession(input.store, input.sessionId, input.config, input.prompt)
+  input.terminal?.setTitle(input.store.getSession(input.sessionId).title)
+
+  const activePath = input.store.getActivePath(input.sessionId)
+  const transcript = input.displayTranscript?.() ?? entriesToTranscript(activePath)
+  const planState = currentPlanModeState(activePath)
+  permissions.setSessionMode(input.sessionId, planState.mode, planState.planPath)
+  const skillCatalog = await loadSkills(input.cwd, { extraPaths: input.config.skillPaths })
+  const systemPrompt = appendResponseModeGuidance(
+    appendPlanModeGuidance(appendSkillGuidance(input.config.systemPrompt, skillCatalog.skills), planState),
+    input.responseModes ?? [],
+  )
+  const messages: OpenRouterMessage[] = entriesToModelMessages(systemPrompt, activePath, { cwd: input.cwd })
+  updateTerminalContextUsage(input.terminal, input.config, messages, toolDefinitions, input.contextWindow)
+
+  if (input.terminal) input.terminal.setTranscript(transcript)
+  else if (input.outputFormat !== "json") renderAssistantStart(transcript)
+
+  const toolActivities: ToolActivity[] = []
+  const toolSnapshots = new Map<string, ReturnType<typeof captureFileSnapshot>>()
+  const terminal = input.terminal
+  let streamingText = ""
+  terminal?.setStreamingContent("")
+  let agentResult
+  const startedAt = Date.now()
+  try {
+    agentResult = await runAgentTurn({
+    config: input.config,
+    cwd: input.cwd,
+    fileReadStore: input.store,
+    messages,
+    onTextDelta: terminal
+      ? (delta) => {
+          streamingText += delta
+          terminal.setThinking(false)
+          terminal.setStreamingContent(streamingText)
+        }
+      : undefined,
+    onPermissionRequest: terminal
+      ? async (request) => {
+          terminal.setThinking(true, `Waiting for ${request.toolName} approval`)
+          const decision = await terminal.requestApproval(request)
+          terminal.setThinking(true, "Thinking")
+          return decision
+        }
+      : undefined,
+    onQuestionRequest: terminal
+      ? async (request) => {
+          terminal.setThinking(true, "Waiting for your answer")
+          const response = await terminal.requestQuestions(request)
+          terminal.setThinking(true, "Thinking")
+          return response
+        }
+      : undefined,
+    permissions,
+    sessionId: input.sessionId,
+    signal: input.signal,
+    taskRunner,
+    todoStore: input.store,
+    onBeforeModelRequest: async (currentMessages, activeTools) => {
+      const compacted = await compactMessagesBeforeRequest({
+        config: input.config,
+        currentMessages,
+        cwd: input.cwd,
+        reason: "threshold",
+        sessionId: input.sessionId,
+        store: input.store,
+        systemPrompt,
+        terminal: input.terminal,
+        tools: activeTools,
+      })
+      const transformed = await applyHeadroomLiteRequestTransforms({ cwd: input.cwd, messages: compacted })
+      updateTerminalContextUsage(input.terminal, input.config, transformed.messages, activeTools, input.contextWindow)
+      return transformed.messages
+    },
+    onContextOverflow: (_currentMessages, activeTools) => compactMessagesAfterOverflow({
+      config: input.config,
+      cwd: input.cwd,
+      sessionId: input.sessionId,
+      store: input.store,
+      systemPrompt,
+      terminal: input.terminal,
+      tools: activeTools,
+    }),
+    onToolStart: (call) => {
+      streamingText = ""
+      terminal?.setStreamingContent("")
+      const fileSnapshot = captureFileSnapshot(call.name, call.arguments, input.cwd)
+      toolSnapshots.set(call.id, fileSnapshot)
+      input.store.appendToolCall(input.sessionId, {
+        arguments: call.arguments,
+        fileSnapshot,
+        name: call.name,
+        toolCallId: call.id,
+      })
+      toolActivities.push({ args: call.arguments, id: call.id, name: call.name, status: "running" })
+      input.terminal?.setToolActivities([...toolActivities])
+      input.terminal?.setThinking(true, `Running ${call.name}`)
+    },
+    onToolResult: (call, content, execution) => {
+      input.store.appendToolResult(input.sessionId, {
+        content,
+        name: call.name,
+        status: execution.status,
+        toolCallId: call.id,
+      })
+      if (execution.status !== "error" && (call.name === "write" || call.name === "edit")) {
+        recordAcceptedLines({
+          apiKey: input.config.apiKey,
+          createdAt: Date.now(),
+          eventId: call.id,
+          lines: acceptedLinesForTool({
+            args: call.arguments,
+            cwd: input.cwd,
+            snapshot: toolSnapshots.get(call.id),
+            toolName: call.name,
+          }),
+          provider: input.config.provider,
+        })
+      }
+      const index = toolActivities.findIndex((activity) => activity.id === call.id)
+      const status = execution.status === "error" ? "failed" : "done"
+      const activity = { args: call.arguments, id: call.id, name: call.name, result: content, status } satisfies ToolActivity
+      if (index >= 0) toolActivities[index] = activity
+      else toolActivities.push(activity)
+      input.terminal?.setToolActivities([...toolActivities])
+      streamingText = ""
+      terminal?.setStreamingContent("")
+      input.terminal?.setThinking(true, "Thinking")
+    },
+  })
+  } catch (error) {
+    if (isAbortError(error)) {
+      closeInterruptedToolCalls(input.store, input.sessionId)
+      if (streamingText.trim()) {
+        input.store.appendMessage(input.sessionId, "assistant", streamingText, { model: input.config.model })
+        if (terminal) {
+          terminal.setThinking(false)
+          terminal.setStreamingContent("")
+          terminal.setTranscript(input.displayTranscript?.() ?? entriesToTranscript(input.store.getActivePath(input.sessionId)))
+        }
+      }
+    }
+    throw error
+  }
+  const assistantText = await visibleAssistantTextForMode(input.cwd, agentResult.content, planState)
+  const pricing = await currentModelPricing(input.config, input.config.model)
+
+  const turnUsage = agentResult.usage
+    ? {
+      cacheReadTokens: agentResult.usage.cacheReadTokens,
+      cacheWriteTokens: agentResult.usage.cacheWriteTokens,
+      promptTokens: agentResult.usage.promptTokens,
+      completionTokens: agentResult.usage.completionTokens,
+      costUsd: typeof agentResult.usage.costUsd === "number" ? agentResult.usage.costUsd : calculateUsageCostUsd(agentResult.usage, pricing),
+      model: input.config.model,
+      provider: input.config.provider,
+    }
+    : undefined
+
+  const assistantEntry = input.store.appendMessage(input.sessionId, "assistant", assistantText, { model: input.config.model, usage: turnUsage })
+  recordTurnUsage({
+    apiKey: input.config.apiKey,
+    createdAt: assistantEntry.createdAt,
+    eventId: assistantEntry.id,
+    provider: input.config.provider,
+    usage: turnUsage,
+  })
+  if (input.terminal) {
+    input.terminal.setThinking(false)
+    updateTerminalCostUsage(input.terminal, input.store, input.sessionId, input.config)
+    input.terminal.setTranscript(input.displayTranscript?.() ?? entriesToTranscript(input.store.getActivePath(input.sessionId)))
+    if (planState.mode === "plan" && planState.planPath) {
+      input.onPlanReady?.(planState.planPath)
+    }
+  } else if (input.outputFormat === "json") {
+    const promptTokens = agentResult.usage?.promptTokens ?? null
+    const cacheReadTokens = agentResult.usage?.cacheReadTokens ?? null
+    const cacheWriteTokens = agentResult.usage?.cacheWriteTokens ?? null
+    const completionTokens = agentResult.usage?.completionTokens ?? null
+    const freshInputTokens = promptTokens
+    const output = {
+      content: agentResult.content,
+      model: input.config.model,
+      provider: input.config.provider,
+      sessionId: input.sessionId,
+      cacheReadTokens,
+      cacheWriteTokens,
+      costUsd: turnUsage?.costUsd ?? null,
+      promptTokens,
+      inputTokens: freshInputTokens,
+      completionTokens,
+      totalTokens: promptTokens !== null
+        ? (freshInputTokens ?? 0)
+          + (completionTokens ?? 0)
+          + (cacheReadTokens ?? 0)
+          + (cacheWriteTokens ?? 0)
+        : null,
+      toolCalls: toolActivities.length,
+      elapsedMs: Date.now() - startedAt,
+    }
+    process.stdout.write(JSON.stringify(output, null, 2) + "\n")
+  } else {
+    renderConversation(entriesToTranscript(input.store.getActivePath(input.sessionId)))
+    renderDone()
+  }
+}
+
+function createSubagentTaskManager(input: {
+  cwd: string
+  executeChildTask: (record: TaskRecord, signal: AbortSignal, manager: TaskManager) => Promise<string>
+  onGroupComplete?: TaskManagerOptions["onGroupComplete"]
+  onUpdate?: TaskManagerOptions["onUpdate"]
+  permissions: SessionPermissionStore
+  store: SessionStore
+}): TaskManager {
+  let manager!: TaskManager
+  manager = new TaskManager({
+    createChildTask: ({ description, parentSessionId, prompt }) => {
+      const child = input.store.createSession({
+        cwd: input.cwd,
+        parentSessionId,
+        relationType: "subagent",
+        rootSessionId: parentSessionId,
+        title: `${description} (subagent)`,
+      })
+      input.permissions.inheritSession(child.id, parentSessionId)
+      inheritPlanMode(input.store, input.permissions, parentSessionId, child.id)
+      return {
+        background: false,
+        childSessionId: child.id,
+        description,
+        id: makeTaskId("task"),
+        parentSessionId,
+        prompt,
+        startedAt: Date.now(),
+        status: "running",
+      }
+    },
+    executeChildTask: (record, signal) => input.executeChildTask(record, signal, manager),
+    onGroupComplete: input.onGroupComplete,
+    onUpdate: input.onUpdate,
+  })
+  return manager
+}
+
+function inheritPlanMode(
+  store: SessionStore,
+  permissions: SessionPermissionStore,
+  parentSessionId: string,
+  childSessionId: string,
+): void {
+  const state = currentPlanModeState(store.getActivePath(parentSessionId))
+  if (state.mode !== "plan") return
+  store.appendEntry<PlanModeEntryData>(childSessionId, "custom", null, {
+    kind: "mode_change",
+    mode: "plan",
+    planPath: state.planPath,
+    reason: "inherited",
+  })
+  permissions.setSessionMode(childSessionId, "plan", state.planPath)
+}
+
+async function runSubagentTask(input: {
+  config: Awaited<ReturnType<typeof loadConfig>>
+  cwd: string
+  permissions: SessionPermissionStore
+  record: TaskRecord
+  signal: AbortSignal
+  store: SessionStore
+  taskManager?: TaskManager
+  terminal?: CodeshTerminal
+}): Promise<string> {
+  const prompt = formatSubagentPrompt(input.record)
+  input.store.appendMessage(input.record.childSessionId, "user", prompt)
+  const skillCatalog = await loadSkills(input.cwd, { extraPaths: input.config.skillPaths })
+  const activePath = input.store.getActivePath(input.record.childSessionId)
+  const planState = currentPlanModeState(activePath)
+  input.permissions.setSessionMode(input.record.childSessionId, planState.mode, planState.planPath)
+  const systemPrompt = appendPlanModeGuidance(appendSkillGuidance(input.config.subagentSystemPrompt, skillCatalog.skills), planState)
+  const messages: OpenRouterMessage[] = entriesToModelMessages(systemPrompt, activePath, { cwd: input.cwd })
+  const terminal = input.terminal
+  const foregroundTerminal = (): CodeshTerminal | undefined => input.record.background ? undefined : terminal
+  const toolSnapshots = new Map<string, ReturnType<typeof captureFileSnapshot>>()
+
+  const result = await runAgentTurn({
+    config: input.config,
+    cwd: input.cwd,
+    fileReadStore: input.store,
+    messages,
+    onPermissionRequest: terminal
+      ? async (request) => {
+          foregroundTerminal()?.setThinking(true, `Waiting for subagent ${request.toolName} approval`)
+          const decision = await terminal.requestApproval(request)
+          foregroundTerminal()?.setThinking(true, "Thinking")
+          return decision
+        }
+      : undefined,
+    onQuestionRequest: terminal
+      ? async (request) => {
+          foregroundTerminal()?.setThinking(true, "Waiting for your subagent answer")
+          const response = await terminal.requestQuestions(request)
+          foregroundTerminal()?.setThinking(true, "Thinking")
+          return response
+        }
+      : undefined,
+    permissions: input.permissions,
+    sessionId: input.record.childSessionId,
+    signal: input.signal,
+    tools: childToolDefinitions,
+    todoStore: input.store,
+    onBeforeModelRequest: async (currentMessages, activeTools) => {
+      const compacted = await compactMessagesBeforeRequest({
+        config: input.config,
+        currentMessages,
+        cwd: input.cwd,
+        reason: "threshold",
+        sessionId: input.record.childSessionId,
+        store: input.store,
+        systemPrompt,
+        terminal: foregroundTerminal(),
+        tools: activeTools,
+      })
+      return (await applyHeadroomLiteRequestTransforms({ cwd: input.cwd, messages: compacted })).messages
+    },
+    onContextOverflow: (_currentMessages, activeTools) => compactMessagesAfterOverflow({
+      config: input.config,
+      cwd: input.cwd,
+      sessionId: input.record.childSessionId,
+      store: input.store,
+      systemPrompt,
+      terminal: foregroundTerminal(),
+      tools: activeTools,
+    }),
+    onToolStart: (call) => {
+      toolSnapshots.set(call.id, captureFileSnapshot(call.name, call.arguments, input.cwd))
+      input.store.appendToolCall(input.record.childSessionId, {
+        arguments: call.arguments,
+        name: call.name,
+        toolCallId: call.id,
+      })
+      input.taskManager?.recordToolActivity(input.record.childSessionId, call.name)
+    },
+    onToolResult: (call, content, execution) => {
+      input.store.appendToolResult(input.record.childSessionId, {
+        content,
+        name: call.name,
+        status: execution.status,
+        toolCallId: call.id,
+      })
+      if (execution.status !== "error" && (call.name === "write" || call.name === "edit")) {
+        recordAcceptedLines({
+          apiKey: input.config.apiKey,
+          createdAt: Date.now(),
+          eventId: call.id,
+          lines: acceptedLinesForTool({
+            args: call.arguments,
+            cwd: input.cwd,
+            snapshot: toolSnapshots.get(call.id),
+            toolName: call.name,
+          }),
+          provider: input.config.provider,
+        })
+      }
+    },
+  })
+
+  const pricing = await currentModelPricing(input.config, input.config.model)
+  const turnUsage = result.usage
+    ? {
+      cacheReadTokens: result.usage.cacheReadTokens,
+      cacheWriteTokens: result.usage.cacheWriteTokens,
+      promptTokens: result.usage.promptTokens,
+      completionTokens: result.usage.completionTokens,
+      costUsd: typeof result.usage.costUsd === "number" ? result.usage.costUsd : calculateUsageCostUsd(result.usage, pricing),
+      model: input.config.model,
+      provider: input.config.provider,
+    }
+    : undefined
+  const assistantEntry = input.store.appendMessage(input.record.childSessionId, "assistant", result.content, {
+    model: input.config.model,
+    usage: turnUsage,
+  })
+  recordTurnUsage({
+    apiKey: input.config.apiKey,
+    createdAt: assistantEntry.createdAt,
+    eventId: assistantEntry.id,
+    provider: input.config.provider,
+    usage: turnUsage,
+  })
+  return result.content
+}
+
+async function compactMessagesBeforeRequest(input: {
+  config: Awaited<ReturnType<typeof loadConfig>>
+  currentMessages: OpenRouterMessage[]
+  cwd: string
+  reason: Extract<CompactionReason, "threshold">
+  sessionId: string
+  store: SessionStore
+  systemPrompt: string
+  terminal?: CodeshTerminal
+  tools: OpenRouterToolDefinition[]
+}): Promise<OpenRouterMessage[]> {
+  const result = await runCompaction({
+    config: input.config,
+    cwd: input.cwd,
+    reason: input.reason,
+    sessionId: input.sessionId,
+    store: input.store,
+    systemPrompt: input.systemPrompt,
+    terminal: input.terminal,
+    tools: input.tools,
+  })
+  if (!result.entry) return input.currentMessages
+  return entriesToModelMessages(input.systemPrompt, input.store.getActivePath(input.sessionId), { cwd: input.cwd })
+}
+
+async function compactMessagesAfterOverflow(input: {
+  config: Awaited<ReturnType<typeof loadConfig>>
+  cwd: string
+  sessionId: string
+  store: SessionStore
+  systemPrompt: string
+  terminal?: CodeshTerminal
+  tools: OpenRouterToolDefinition[]
+}): Promise<OpenRouterMessage[] | undefined> {
+  const result = await runCompaction({
+    config: input.config,
+    cwd: input.cwd,
+    force: true,
+    reason: "overflow",
+    sessionId: input.sessionId,
+    store: input.store,
+    systemPrompt: input.systemPrompt,
+    terminal: input.terminal,
+    tools: input.tools,
+  })
+  if (!result.entry) return undefined
+  return entriesToModelMessages(input.systemPrompt, input.store.getActivePath(input.sessionId), { cwd: input.cwd })
+}
+
+async function runCompaction(input: {
+  config: Awaited<ReturnType<typeof loadConfig>>
+  cwd: string
+  force?: boolean
+  reason: CompactionReason
+  sessionId: string
+  store: SessionStore
+  systemPrompt: string
+  terminal?: CodeshTerminal
+  tools: OpenRouterToolDefinition[]
+}) {
+  input.terminal?.setThinking(true, input.reason === "overflow" ? "Compacting after context overflow" : "Checking context")
+  const result = await compactSessionIfNeeded({
+    config: input.config,
+    cwd: input.cwd,
+    force: input.force,
+    reason: input.reason,
+    sessionId: input.sessionId,
+    store: input.store,
+    systemPrompt: input.systemPrompt,
+    tools: input.tools,
+  })
+  if (result.entry) input.terminal?.setThinking(true, "Compacted context")
+  else input.terminal?.setThinking(true, "Thinking")
+
+  return result
+}
+
+function formatSubagentPrompt(record: TaskRecord): string {
+  return [
+    `Delegated task: ${record.description}`,
+    "",
+    "You are running in a child session linked to a parent Codesh conversation.",
+    "Use only the context below; if something is missing, make a conservative assumption and mention it in your final summary.",
+    "",
+    "<task_prompt>",
+    record.prompt,
+    "</task_prompt>",
+    "",
+    "Final response requirements:",
+    "- Start with a concise outcome summary.",
+    "- Include files changed, commands run, and verification results when applicable.",
+    "- If blocked, state the blocker and the next action the parent agent should take.",
+  ].join("\n")
+}
+
+export function formatBackgroundTaskCompletion(records: TaskRecord[]): string {
+  const lines = [
+    "Background subagent group completed. Use these results to continue the user's work.",
+    "",
+    ...records.flatMap((record, index) => [
+      `Task ${index + 1}: ${record.description}`,
+      `- task_id: ${record.id}`,
+      `- status: ${record.status}`,
+      ...(record.error ? [`- error: ${record.error}`] : []),
+      ...(record.result ? [`- result:\n${indentBlock(record.result)}`] : []),
+      "",
+    ]),
+  ]
+  return lines.join("\n").trim()
+}
+
+function hasActiveSubagentTasks(records: TaskRecord[]): boolean {
+  return records.some((record) => record.status === "running" || record.status === "backgrounded")
+}
+
+function lastUserPrompt(store: SessionStore, sessionId: string): string {
+  const entry = [...store.getActivePath(sessionId)].reverse().find((candidate) => candidate.type === "message" && candidate.role === "user" && !(candidate.data as MessageEntryData).hidden)
+  const content = entry ? (entry.data as MessageEntryData).content : ""
+  return firstLine(content)
+}
+
+function formatTaskStatusForUser(records: TaskRecord[]): string {
+  const visible = records.filter((record) => record.status === "running" || record.status === "backgrounded")
+  if (visible.length === 0) return "No active subagent tasks for this conversation."
+  return visible
+    .map((record) => {
+      const elapsed = formatTaskElapsed((record.completedAt || Date.now()) - record.startedAt)
+      return [
+        `${record.status}: ${record.description}`,
+        `task_id: ${record.id}`,
+        `elapsed: ${elapsed}`,
+        record.error ? `error: ${record.error}` : "",
+      ]
+        .filter(Boolean)
+        .join("\n")
+    })
+    .join("\n\n")
+}
+
+function formatTaskElapsed(ms: number): string {
+  const seconds = Math.max(0, Math.round(ms / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  return `${minutes}m${(seconds % 60).toString().padStart(2, "0")}s`
+}
+
+function normalizePinnedChatIds(ids: string[] | undefined): string[] {
+  if (!Array.isArray(ids)) return []
+  return [...new Set(ids.map((id) => id.trim()).filter(Boolean))].slice(0, 5)
+}
+
+function shortEntryId(id: string): string {
+  const suffix = id.includes("_") ? id.split("_").pop() || id : id
+  return suffix.slice(0, 8)
+}
+
+function firstLine(value: string, max = 72): string {
+  const line = value.replace(/\s+/g, " ").trim().split("\n")[0] || "(empty prompt)"
+  return line.length > max ? `${line.slice(0, max - 1)}…` : line
+}
+
+function hasConversationMessages(entries: ReturnType<SessionStore["getActivePath"]>): boolean {
+  const hasUser = entries.some((entry) => entry.type === "message" && entry.role === "user" && typeof (entry.data as { content?: unknown }).content === "string" && (entry.data as { content: string }).content.trim())
+  const hasAssistant = entries.some((entry) => entry.type === "message" && entry.role === "assistant" && typeof (entry.data as { content?: unknown }).content === "string" && (entry.data as { content: string }).content.trim())
+  return hasUser && hasAssistant
+}
+
+function sessionTitleById(store: SessionStore, sessionId: string): string {
+  try {
+    return store.getSession(sessionId).title
+  } catch {
+    return sessionId
+  }
+}
+
+function formatHistoryOverview(store: SessionStore, cwd: string, sessions = store.listHistorySessions(cwd)): string[] {
+  const recent = sessions.slice(0, 10).map((session, index) => {
+    const forkLabel = session.relationType === "fork" && session.parentSessionId ? `      fork of ${sessionTitleById(store, session.parentSessionId)}` : ""
+    return `${index + 1}. ${session.title} (${formatRelativeTime(session.updatedAt)})${forkLabel}`
+  })
+  const roots = sessions.filter((session) => session.relationType !== "fork")
+  const branchLines: string[] = []
+  for (const root of roots) {
+    const children = store.listForkChildren(root.id)
+    if (children.length === 0) continue
+    branchLines.push(root.title)
+    children.slice(0, 6).forEach((child, index) => {
+      const stem = index === Math.min(children.length, 6) - 1 ? "└─" : "├─"
+      branchLines.push(`${stem} ${child.title} (${formatRelativeTime(child.updatedAt)})`)
+    })
+  }
+  if (branchLines.length === 0) return ["Recent", ...recent]
+  return ["Recent", ...recent, "", "Branches", ...branchLines]
+}
+
+function formatSkillsList(skills: Skill[]): string {
+  if (skills.length === 0) return "No skills discovered. Add SKILL.md files or configure skillPaths in .codesh/preferences.json, then run /skills reload."
+  return [
+    `Discovered ${skills.length} skill${skills.length === 1 ? "" : "s"}:`,
+    "",
+    ...skills.map((skill) => {
+      const mode = skill.disableModelInvocation ? "manual" : "auto"
+      return `- /skill:${skill.name} [${mode}, ${skill.provenance}] ${skill.description}`
+    }),
+    "",
+    "Use /skills view <name> to inspect a skill, or /skills reload after adding/editing skills.",
+  ].join("\n")
+}
+
+function formatSkillView(skills: Skill[], name: string): string {
+  if (!name) return "Usage: /skills view <name>"
+  const skill = skills.find((candidate) => candidate.name === name)
+  if (!skill) return `Unknown skill: ${name}\nUse /skills list to see available skills.`
+  return [
+    `# ${skill.name}`,
+    "",
+    `Description: ${skill.description}`,
+    `Invocation: ${skill.disableModelInvocation ? "manual only" : "automatic guidance + explicit /skill"}`,
+    `Provenance: ${skill.provenance}`,
+    `Path: ${skill.filePath}`,
+    "",
+    skill.content.trim(),
+  ].join("\n")
+}
+
+function indentBlock(value: string): string {
+  return value
+    .split(/\r?\n/)
+    .map((line) => `  ${line}`)
+    .join("\n")
+}
+
+async function maybeTitleSession(
+  store: SessionStore,
+  sessionId: string,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  firstPrompt: string,
+): Promise<void> {
+  const session = store.getSession(sessionId)
+  if (session.title !== "New Chat") return
+
+  try {
+    store.updateSessionTitle(sessionId, await generateSessionTitle(config, firstPrompt))
+  } catch {
+    store.updateSessionTitle(sessionId, fallbackTitle(firstPrompt))
+  }
+}
+
+function formatError(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
+}
+
+function renderEvolveEditPrompt(request: string, root: string): string {
+  return [
+    "You are modifying the codesh harness itself (self-modification / evolve mode).",
+    `The codesh source root is: ${root}`,
+    "",
+    `Requested change: ${request}`,
+    "",
+    "Guidelines:",
+    "- Edit the codesh source under this root to implement the requested change.",
+    "- Follow existing patterns (themes in src/ui/themes/, thinking text via setThinking in src/ui/pi-terminal.ts, status line in the footer, etc.).",
+    "- Keep the change minimal and focused on the request.",
+    "- Do NOT run `npm run build`, `npm test`, or scripts/clean-dist.mjs — the evolve orchestrator owns verification and building.",
+    "- Ensure the change is type-correct; the orchestrator will run typecheck, tests, and an atomic build after you finish.",
+    "- When done, briefly summarize what you changed.",
+  ].join("\n")
+}
+
+function renderEvolveMergePrompt(state: EvolveMigrationState): string {
+  return [
+    "You are resolving an automatic Codesh evolve migration that could not be applied cleanly.",
+    `Old evolved source: ${state.oldRoot}`,
+    `New Codesh source to repair: ${state.targetRoot}`,
+    `Version migration: ${state.fromVersion} -> ${state.toVersion}`,
+    ...(state.patchPath ? [`Saved cumulative evolve patch: ${state.patchPath}`] : []),
+    `Automatic migration error: ${state.error}`,
+    "",
+    "Resolve the migration in the new source root:",
+    "- Start with `git status` and inspect the current target diff; the automatic attempt may have applied some or all changes before failing.",
+    ...(state.patchPath ? ["- Inspect the saved cumulative patch to identify every intended customization."] : []),
+    ...(existsSync(state.oldRoot) ? ["- Compare against the old evolved source when the patch or conflict markers are incomplete."] : []),
+    "- Preserve the new Codesh version's upstream behavior while carrying forward the user's evolved changes wherever compatible.",
+    "- Resolve every Git conflict and stage resolved files with `git add`.",
+    "- Do not commit, build, or run the full test suite; the migration orchestrator verifies and builds after review.",
+    "- If an old customization is no longer compatible, implement the closest safe equivalent and explain it.",
+    "- When complete, summarize the merge decisions.",
+  ].join("\n")
+}
+
+function renderEvolveOutcomeMessage(request: string, outcome: EvolveOutcome): string {
+  if (outcome.status === "unavailable") {
+    return `Evolve unavailable: ${outcome.message}`
+  }
+  const themeFiles = outcome.createdFiles.filter((path) => /ui\/themes\/.+\.ts$/.test(path) && !path.endsWith("index.ts") && !path.endsWith("types.ts"))
+  if (outcome.status === "applied") {
+    const lines = [
+      `Evolved codesh: "${request}".`,
+      "Verified (typecheck, build, launch check) and applied.",
+      ...(outcome.createdFiles.length > 0 ? [`New files: ${outcome.createdFiles.join(", ")}`] : []),
+      ...(themeFiles.length > 0 ? ["New theme added — after restarting, run /theme and select it to activate it."] : []),
+      `Restart codesh to load your changes. If startup breaks, run: codesh --recover ${outcome.recoveryId}`,
+      ...(outcome.runningBinMatchesRoot ? [] : ["Note: the running codesh appears to live outside this source root, so the rebuilt bundle may not be what you launch."]),
+    ]
+    return lines.join("\n")
+  }
+  if (outcome.status === "verify-failed") {
+    return `Evolve "${request}" failed verification at the ${outcome.step} step and was reverted — no changes applied. Recovery point ${outcome.recoveryId} left in place.\n\n${outcome.log.slice(0, 1500)}`
+  }
+  return `Evolve "${request}" was discarded (change not approved) and reverted — no changes applied.`
+}
+
+function renderEvolveConsentPrompt(diff: string, createdFiles: string[], _verifyLog: string): string {
+  const created = createdFiles.length > 0 ? `\nNew files: ${createdFiles.join(", ")}` : ""
+  const stat = diff
+    ? diff.length > 2000 ? `${diff.slice(0, 2000)}\n... (truncated)` : diff
+    : "(no tracked-file changes detected)"
+  return `Apply this change to codesh? Verified (typecheck, build, launch check passed).${created}\n\nChanged files:\n${stat}`
+}
+
+function formatTokenCount(tokens: number): string {
+  if (tokens >= 1_000_000) return `${(tokens / 1_000_000).toFixed(1)}M`
+  if (tokens >= 1_000) return `${Math.round(tokens / 1_000)}K`
+  return String(tokens)
+}
+
+function updateTerminalContextUsage(
+  terminal: CodeshTerminal | undefined,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+  messages: OpenRouterMessage[],
+  tools: OpenRouterToolDefinition[],
+  contextWindow?: number,
+): void {
+  terminal?.setContextUsage(estimateRequestTokens(messages, tools), contextWindow ?? effectiveContextWindow(config))
+}
+
+function effectiveContextWindow(config: Awaited<ReturnType<typeof loadConfig>>, models: OpenRouterModel[] = []): number {
+  const configured = config.modelSettings.contextLength
+  if (typeof configured === "number" && configured > 0) return configured
+  const modelContext = models.find((model) => model.id === config.model)?.contextLength
+  if (typeof modelContext === "number" && modelContext > 0) return modelContext
+  return resolveCompactionSettings(config).contextWindow
+}
+
+function updateTerminalCostUsage(
+  terminal: CodeshTerminal | undefined,
+  store: SessionStore,
+  sessionId: string,
+  config: Awaited<ReturnType<typeof loadConfig>>,
+): void {
+  if (!terminal) return
+  const sessionUsage = summarizeUsageCosts(store.getActivePath(sessionId))
+  const totalUsage = readKeyUsage(config.provider, config.apiKey)
+  terminal.setCostUsage(sessionUsage.costUsd, totalUsage.costUsd, {
+    sessionIncomplete: sessionUsage.unknownCostTurns > 0,
+    totalIncomplete: totalUsage.unknownCostTurns > 0,
+  })
+}
+
+async function currentModelPricing(config: Awaited<ReturnType<typeof loadConfig>>, modelId: string) {
+  const models = await listOpenRouterModels(config).catch(() => [])
+  const apiPricing = models.find((model) => model.id === modelId)?.pricing
+  return resolveModelPricing(modelId, apiPricing)
+}
+
+function formatCompactionSkip(reason: string | undefined): string {
+  if (reason === "below_threshold") return "context is below the automatic threshold"
+  if (reason === "empty_session") return "session is empty"
+  if (reason === "already_compacted") return "latest entry is already a compaction marker"
+  if (reason === "no_recent_suffix") return "could not find a safe recent suffix"
+  if (reason === "nothing_to_summarize") return "not enough older context to summarize"
+  if (reason === "ineffective_compaction") return "compaction did not save enough context"
+  return reason || "unknown reason"
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException
+    ? error.name === "AbortError"
+    : error instanceof Error && (error.name === "AbortError" || /aborted|interrupted/i.test(error.message))
+}
+
+function closeInterruptedToolCalls(store: SessionStore, sessionId: string): void {
+  for (const call of pendingToolCalls(store.getActivePath(sessionId))) {
+    store.appendToolResult(sessionId, {
+      content: "Tool call interrupted.",
+      name: call.name,
+      status: "error",
+      toolCallId: call.toolCallId,
+    })
+  }
+}
+
+function formatRelativeTime(timestamp: number): string {
+  const now = Date.now()
+  const diffMs = Math.max(0, now - timestamp)
+  const minute = 60 * 1000
+  const hour = 60 * minute
+  const day = 24 * hour
+
+  if (isYesterday(timestamp, now) && diffMs >= 15 * hour) return "Yesterday"
+  if (diffMs < minute) return "Just now"
+  if (diffMs < hour) {
+    const minutes = Math.max(1, Math.floor(diffMs / minute))
+    return `${minutes} min${minutes === 1 ? "" : "s"} ago`
+  }
+  if (diffMs < day) {
+    const hours = Math.max(1, Math.floor(diffMs / hour))
+    return `${hours} hour${hours === 1 ? "" : "s"} ago`
+  }
+
+  const days = Math.max(1, Math.floor(diffMs / day))
+  return `${days} day${days === 1 ? "" : "s"} ago`
+}
+
+function isYesterday(timestamp: number, now: number): boolean {
+  const date = new Date(timestamp)
+  const yesterday = new Date(now)
+  yesterday.setDate(yesterday.getDate() - 1)
+  return date.getFullYear() === yesterday.getFullYear() && date.getMonth() === yesterday.getMonth() && date.getDate() === yesterday.getDate()
+}
+
+function captureFileSnapshot(toolName: string, args: string, cwd: string): { existed: boolean; path: string; previousContent?: string } | undefined {
+  if (toolName !== "write" && toolName !== "edit") return undefined
+  try {
+    const parsed = JSON.parse(args) as Record<string, unknown>
+    let filePath: string | undefined
+    if (toolName === "write") {
+      filePath = typeof parsed.path === "string" ? parsed.path : undefined
+    } else {
+      const patch = typeof parsed.patch === "string" ? parsed.patch : ""
+      const match = patch.match(/^\*\*\* (?:Update|Add) File: (.+)$/m)
+      filePath = match?.[1]?.trim()
+    }
+    if (!filePath) return undefined
+    const absPath = resolve(cwd, filePath)
+    if (!existsSync(absPath)) return { existed: false, path: filePath }
+    const previousContent = readFileSync(absPath, "utf8")
+    return { existed: true, path: filePath, previousContent }
+  } catch {
+    return undefined
+  }
+}
+
+function formatTokenCompact(tokens: number): string {
+  if (tokens >= 1_000_000) {
+    const v = tokens / 1_000_000
+    return Number.isInteger(v) ? `${v}M` : `${v.toFixed(1)}M`
+  }
+  if (tokens >= 1_000) {
+    const v = tokens / 1_000
+    return Number.isInteger(v) ? `${v}K` : `${v.toFixed(1)}K`
+  }
+  return String(tokens)
+}
+
+function formatCostUsd(value: number): string {
+  if (value <= 0) return "$0.0000"
+  if (value < 0.0001) return "<$0.0001"
+  if (value < 1) return `$${value.toFixed(4)}`
+  if (value < 100) return `$${value.toFixed(2)}`
+  return `$${Math.round(value).toLocaleString()}`
+}
+
+function simpleDiff(filePath: string, before: string, after: string): string {
+  const beforeLines = before.split("\n")
+  const afterLines = after.split("\n")
+  const lines: string[] = [`--- a/${filePath}`, `+++ b/${filePath}`]
+  // Minimal line-by-line diff (shows all changed hunks, no context)
+  const maxLen = Math.max(beforeLines.length, afterLines.length)
+  let hunkStart = -1
+  for (let i = 0; i <= maxLen; i++) {
+    const same = i < maxLen && beforeLines[i] === afterLines[i]
+    if (!same && hunkStart < 0) hunkStart = i
+    if ((same || i === maxLen) && hunkStart >= 0) {
+      lines.push(`@@ -${hunkStart + 1},${i - hunkStart} +${hunkStart + 1},${i - hunkStart} @@`)
+      for (let j = hunkStart; j < i; j++) {
+        if (j < beforeLines.length) lines.push(`-${beforeLines[j]}`)
+        if (j < afterLines.length) lines.push(`+${afterLines[j]}`)
+      }
+      hunkStart = -1
+    }
+  }
+  return lines.join("\n")
+}
+
+function computeDiffStats(before: string, after: string): { additions: number; removals: number } {
+  const beforeLines = before.split("\n")
+  const afterLines = after.split("\n")
+  let additions = 0
+  let removals = 0
+  const maxLen = Math.max(beforeLines.length, afterLines.length)
+  let hunkStart = -1
+  for (let i = 0; i <= maxLen; i++) {
+    const same = i < maxLen && beforeLines[i] === afterLines[i]
+    if (!same && hunkStart < 0) hunkStart = i
+    if ((same || i === maxLen) && hunkStart >= 0) {
+      for (let j = hunkStart; j < i; j++) {
+        if (j < beforeLines.length) removals++
+        if (j < afterLines.length) additions++
+      }
+      hunkStart = -1
+    }
+  }
+  return { additions, removals }
+}
+
+function copyToClipboard(text: string): void {
+  try {
+    if (process.platform === "darwin") {
+      const proc = spawnSync("pbcopy", { input: text })
+      if (proc.status === 0) return
+    } else {
+      let proc = spawnSync("xclip", ["-selection", "clipboard"], { input: text })
+      if (proc.status === 0) return
+      proc = spawnSync("xsel", ["--clipboard", "--input"], { input: text })
+    }
+  } catch { /* clipboard tool unavailable */ }
+}
+
+async function checkForUpdate(): Promise<string | undefined> {
+  try {
+    const res = await fetch(`https://registry.npmjs.org/${packageName}/latest`, { signal: AbortSignal.timeout(2000) })
+    if (!res.ok) return undefined
+    const data = (await res.json()) as { version?: string }
+    const latest = data.version
+    if (!latest || latest === packageVersion) return undefined
+    if (semverGt(latest, packageVersion)) return `New Codesh version ${latest} available — run codesh update.`
+  } catch { /* network unavailable or timeout */ }
+  return undefined
+}
+
+function semverGt(a: string, b: string): boolean {
+  const parse = (v: string): number[] => v.split(".").map(Number)
+  const [aMaj = 0, aMin = 0, aPat = 0] = parse(a)
+  const [bMaj = 0, bMin = 0, bPat = 0] = parse(b)
+  if (aMaj !== bMaj) return aMaj > bMaj
+  if (aMin !== bMin) return aMin > bMin
+  return aPat > bPat
+}
