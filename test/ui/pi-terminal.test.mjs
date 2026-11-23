@@ -1,0 +1,1082 @@
+import { test } from "node:test"
+import assert from "node:assert/strict"
+
+const { compactDirectionalKeyText, createCodeshTerminal, formatTipNotice, inputCursorStyleSequence, queueDisplayRows, shouldRenderTipNotice } = await import("../../dist/ui/pi-terminal.js")
+const { FooterComponent, formatContextDisplay } = await import("../../dist/ui/pi/components/footer.js")
+const { CustomEditor } = await import("../../dist/ui/pi/components/custom-editor.js")
+const { KeybindingsManager, queueKeybindingsForPlatform } = await import("../../dist/ui/pi/keybindings.js")
+const { ToolExecutionComponent } = await import("../../dist/ui/pi/components/tool-execution.js")
+const { StfuToolGroup, compactToolSummary } = await import("../../dist/ui/pi/components/stfu-tool-group.js")
+const { LAYOUT_OPTIONS, LayoutHeaderComponent, LayoutTranscriptSurface } = await import("../../dist/ui/pi/layouts.js")
+const { MODEL_AUTOCOMPLETE_HINT, RelatedAutocompleteSelectList, RESUME_AUTOCOMPLETE_HINT } = await import("../../dist/ui/pi/autocomplete.js")
+const { getEditorTheme, initTheme } = await import("../../dist/ui/pi/theme.js")
+const { TUI, setKeybindings } = await import("@earendil-works/pi-tui")
+
+function stripAnsi(value) {
+  return value.replace(/\x1b\[[0-9;]*m/g, "")
+}
+
+function createMockTerminal() {
+  return {
+    start: () => {},
+    stop: () => {},
+    drainInput: async () => {},
+    write: () => {},
+    moveBy: () => {},
+    hideCursor: () => {},
+    showCursor: () => {},
+    clearLine: () => {},
+    clearFromCursor: () => {},
+    clearScreen: () => {},
+    setTitle: () => {},
+    setProgress: () => {},
+    get columns() { return 80 },
+    get rows() { return 24 },
+    get kittyProtocolActive() { return false },
+  }
+}
+
+test("createCodeshTerminal returns all required CodeshTerminal methods", () => {
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onSubmit: () => {},
+    terminal: createMockTerminal(),
+    themeName: "default",
+    title: "Test",
+  })
+
+  const required = [
+    "cancelQueuedPromptEdit",
+    "clearInteractionPrompts",
+    "clearToolActivities",
+    "clearPlanActions",
+    "requestQuestions",
+    "requestApproval",
+    "showQuestionPrompt",
+    "showApprovalPrompt",
+    "run",
+    "stop",
+    "setBusy",
+    "setContextUsage",
+    "setCostUsage",
+    "setInputDraft",
+    "setInputDisabled",
+    "setLayout",
+    "setStatusLinePreferences",
+    "setSessionMeta",
+    "setLofi",
+    "setResponseModes",
+    "setMode",
+    "setThinking",
+    "setQueuedPrompts",
+    "setRepoIndexStatus",
+    "setSnow",
+    "setTaskStatus",
+    "setTipNotice",
+    "setTipsEnabled",
+    "setPinnedChats",
+    "setSlashCommandItems",
+    "showModelEditor",
+    "showPermissions",
+    "showPlanActions",
+    "showSettings",
+    "showApiKeySetup",
+    "showProviderSelector",
+    "showResumeSearch",
+    "showWhatsNew",
+    "setModel",
+    "setTheme",
+    "setTitle",
+    "setToolActivities",
+    "clearTranscriptDisplay",
+    "setStreamingContent",
+    "setStatusNotice",
+    "setTranscript",
+    "suspendForEditor",
+    "insertImageAttachment",
+  ]
+
+  for (const method of required) {
+    assert.equal(typeof terminal[method], "function", `missing method: ${method}`)
+  }
+})
+
+test("Alt+Up restores the next queued prompt and Alt+Enter sends the edited draft now", async () => {
+  let handleInput = () => {}
+  let sent
+  const image = {
+    id: "queued-image",
+    displayName: "queued.png",
+    source: { type: "base64", media_type: "image/png", data: "aW1hZ2U=" },
+  }
+  const queued = {
+    createdAt: Date.now(),
+    id: "queued-1",
+    images: [image],
+    text: "queued draft",
+  }
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onQueueEdit: (id) => id === queued.id ? queued : undefined,
+    onQueueEditSave: (prompt, sendNow) => {
+      sent = { text: prompt.text, images: prompt.images, sendNow }
+    },
+    onSubmit: () => {},
+    terminal: {
+      ...createMockTerminal(),
+      start: (onInput) => {
+        handleInput = onInput
+      },
+    },
+    themeName: "default",
+    title: "Test",
+  })
+  terminal.setQueuedPrompts([queued])
+
+  const running = terminal.run()
+  handleInput("\x1b[1;3A")
+  handleInput("\x1b\r")
+
+  assert.equal(sent?.text, "queued draft")
+  assert.deepEqual(sent?.images, [image])
+  assert.equal(sent?.sendNow, true)
+  terminal.stop()
+  await running
+})
+
+test("Alt+Up and Alt+Down navigate queued prompts in both directions", async () => {
+  let handleInput = () => {}
+  const editedIds = []
+  const queued = [
+    { createdAt: 1, id: "top", text: "oldest" },
+    { createdAt: 2, id: "middle", text: "middle" },
+    { createdAt: 3, id: "bottom", text: "newest" },
+  ]
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onQueueEdit: (id) => {
+      editedIds.push(id)
+      return queued.find((prompt) => prompt.id === id)
+    },
+    onQueueEditSave: () => {},
+    onSubmit: () => {},
+    terminal: {
+      ...createMockTerminal(),
+      start: (onInput) => {
+        handleInput = onInput
+      },
+    },
+    themeName: "default",
+    title: "Test",
+  })
+  terminal.setQueuedPrompts(queued)
+
+  const running = terminal.run()
+  handleInput("\x1b[1;3A")
+  handleInput("\x1b[1;3A")
+  handleInput("\x1b[1;3B")
+
+  assert.deepEqual(editedIds, ["bottom", "middle", "bottom"])
+  terminal.stop()
+  await running
+})
+
+test("Alt+Backspace deletes the queued prompt being edited", async () => {
+  let handleInput = () => {}
+  let deleted
+  const queued = { createdAt: 1, id: "delete-me", text: "remove this" }
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onQueueEdit: () => queued,
+    onQueueEditDelete: (prompt) => {
+      deleted = prompt
+    },
+    onSubmit: () => {},
+    terminal: {
+      ...createMockTerminal(),
+      start: (onInput) => {
+        handleInput = onInput
+      },
+    },
+    themeName: "default",
+    title: "Test",
+  })
+  terminal.setQueuedPrompts([queued])
+
+  const running = terminal.run()
+  handleInput("\x1b[1;3A")
+  handleInput("\x1b\x7f")
+
+  assert.equal(deleted, queued)
+  terminal.stop()
+  await running
+})
+
+test("editing a queued prompt preserves its visual position", () => {
+  const oldest = { createdAt: 1, id: "oldest", text: "make it five" }
+  const newest = { createdAt: 2, id: "newest", text: "six" }
+  const rows = queueDisplayRows([oldest], newest, 1)
+
+  assert.deepEqual(rows.map((row) => row.prompt?.id), ["oldest", "newest"])
+  assert.deepEqual(rows.map((row) => row.editing), [false, true])
+})
+
+test("directional queue shortcut text combines the shared modifier", () => {
+  assert.equal(
+    compactDirectionalKeyText("alt+up", "alt+down"),
+    process.platform === "darwin" ? "Option+Up/Down" : "Alt+Up/Down",
+  )
+})
+
+test("Alt+Enter sends the focused queued prompt instead of the queue head", async () => {
+  let handleInput = () => {}
+  let sent
+  const queued = [
+    { createdAt: 1, id: "next", text: "send me next" },
+    { createdAt: 2, id: "focused", text: "send selected" },
+  ]
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onQueueEdit: (id) => queued.find((prompt) => prompt.id === id),
+    onQueueEditSave: (prompt, sendNow) => {
+      sent = { id: prompt.id, sendNow }
+    },
+    onSubmit: () => {},
+    terminal: {
+      ...createMockTerminal(),
+      start: (onInput) => {
+        handleInput = onInput
+      },
+    },
+    themeName: "default",
+    title: "Test",
+  })
+  terminal.setQueuedPrompts(queued)
+
+  const running = terminal.run()
+  handleInput("\x1b[1;3A")
+  handleInput("\x1b\r")
+
+  assert.deepEqual(sent, { id: "focused", sendNow: true })
+  terminal.stop()
+  await running
+})
+
+test("Escape cancels queued prompt editing before interrupting the chat", async () => {
+  let handleInput = () => {}
+  let cancelled
+  let interruptCount = 0
+  const queued = { createdAt: Date.now(), id: "queued-1", text: "keep queued" }
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onInterrupt: () => {
+      interruptCount += 1
+    },
+    onQueueEdit: () => queued,
+    onQueueEditCancel: (prompt) => {
+      cancelled = prompt
+    },
+    onSubmit: () => {},
+    terminal: {
+      ...createMockTerminal(),
+      start: (onInput) => {
+        handleInput = onInput
+      },
+    },
+    themeName: "default",
+    title: "Test",
+  })
+  terminal.setQueuedPrompts([queued])
+
+  const running = terminal.run()
+  handleInput("\x1b[1;3A")
+  handleInput("\x1b")
+  assert.equal(cancelled, queued)
+  assert.equal(interruptCount, 0)
+
+  handleInput("\x1b")
+  assert.equal(interruptCount, 1)
+  terminal.stop()
+  await running
+})
+
+test("Alt+Enter promotes the next queued prompt rather than the newest when the draft is empty", async () => {
+  let handleInput = () => {}
+  let promoted
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onQueuePromote: (id) => {
+      promoted = id
+    },
+    onSubmit: () => {},
+    terminal: {
+      ...createMockTerminal(),
+      start: (onInput) => {
+        handleInput = onInput
+      },
+    },
+    themeName: "default",
+    title: "Test",
+  })
+  terminal.setQueuedPrompts([
+    { createdAt: 1, id: "next", text: "send me next" },
+    { createdAt: 2, id: "newest", text: "send me later" },
+  ])
+
+  const running = terminal.run()
+  handleInput("\x1b\r")
+
+  assert.equal(promoted, "next")
+  terminal.stop()
+  await running
+})
+
+test("tips render only on the normal idle agent editor", () => {
+  const idle = {
+    editorSurfaceActive: true,
+    hasActiveStatus: false,
+    hasRepoIndexStatus: false,
+    hasStatusNotice: false,
+    inputDisabled: false,
+    mode: "agent",
+  }
+  assert.equal(shouldRenderTipNotice(idle), true)
+  assert.equal(shouldRenderTipNotice({ ...idle, tipsEnabled: true }), true)
+  assert.equal(shouldRenderTipNotice({ ...idle, tipsEnabled: false }), false)
+  assert.equal(shouldRenderTipNotice({ ...idle, editorSurfaceActive: false }), false)
+  assert.equal(shouldRenderTipNotice({ ...idle, hasActiveStatus: true }), false)
+  assert.equal(shouldRenderTipNotice({ ...idle, hasRepoIndexStatus: true }), false)
+  assert.equal(shouldRenderTipNotice({ ...idle, hasStatusNotice: true }), false)
+  assert.equal(shouldRenderTipNotice({ ...idle, inputDisabled: true }), false)
+  assert.equal(shouldRenderTipNotice({ ...idle, mode: "plan" }), false)
+})
+
+test("tips highlight their label and slash commands", () => {
+  initTheme("default")
+  const rendered = formatTipNotice("Tip: press Tab in /resume or run /theme")
+  assert.match(rendered, /\x1b\[[0-9;]*mTip/)
+  assert.match(rendered, /\x1b\[[0-9;]*m\/resume/)
+  assert.match(rendered, /\x1b\[[0-9;]*m\/theme/)
+  assert.equal(stripAnsi(rendered), "Tip: press Tab in /resume or run /theme")
+})
+
+test("What’s New panel accepts structured release notes", () => {
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onSubmit: () => {},
+    terminal: createMockTerminal(),
+    themeName: "default",
+    title: "Test",
+  })
+
+  assert.doesNotThrow(() => {
+    terminal.showWhatsNew({
+      version: "0.2.4",
+      date: "2026-07-17",
+      status: "upcoming",
+      commit: null,
+      summary: "Release notes are now visible.",
+      changes: [{ kind: "added", text: "Added a What’s New panel." }],
+    }, () => {})
+  })
+})
+
+test("configured providers can activate their existing API key", async () => {
+  let handleInput = () => {}
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onSubmit: () => {},
+    terminal: {
+      ...createMockTerminal(),
+      start: (onInput) => {
+        handleInput = onInput
+      },
+    },
+    themeName: "default",
+    title: "Test",
+  })
+  let usedProvider
+  let editedProvider
+  terminal.showProviderSelector(
+    [{
+      canDelete: true,
+      id: "anthropic",
+      displayName: "Anthropic",
+      sourceLabel: "saved",
+      status: "configured",
+      protocol: "anthropic",
+    }],
+    (providerId) => {
+      editedProvider = providerId
+    },
+    (providerId) => {
+      usedProvider = providerId
+    },
+    () => {},
+    () => {},
+  )
+
+  const running = terminal.run()
+  handleInput("\r")
+  handleInput("\r")
+  assert.equal(usedProvider, "anthropic")
+  assert.equal(editedProvider, undefined)
+  terminal.stop()
+  await running
+})
+
+test("What’s New ignores Enter and closes only with Escape", async () => {
+  let handleInput = () => {}
+  const mockTerminal = {
+    ...createMockTerminal(),
+    start: (onInput) => {
+      handleInput = onInput
+    },
+  }
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onSubmit: () => {},
+    terminal: mockTerminal,
+    themeName: "default",
+    title: "Test",
+  })
+  let continued = false
+  terminal.showWhatsNew({
+    version: "0.2.9",
+    date: "2026-07-18",
+    status: "published",
+    commit: null,
+    summary: "Release notes remain visible.",
+    changes: [{ kind: "fixed", text: "Escape is required to continue." }],
+  }, () => {
+    continued = true
+  })
+
+  const running = terminal.run()
+  handleInput("\r")
+  assert.equal(continued, false)
+  handleInput("\x1b")
+  assert.equal(continued, true)
+  terminal.stop()
+  await running
+})
+
+test("setTranscript and setStreamingContent do not throw", () => {
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onSubmit: () => {},
+    terminal: createMockTerminal(),
+    themeName: "default",
+    title: "Test",
+  })
+
+  assert.doesNotThrow(() => {
+    terminal.setTranscript([
+      { role: "user", content: "hello" },
+      { role: "assistant", content: "hi there" },
+    ])
+    terminal.setStreamingContent("streaming...")
+  })
+})
+
+test("typing indicator preferences map to the user input cursor", () => {
+  assert.equal(inputCursorStyleSequence("block", true), "\x1b[1 q")
+  assert.equal(inputCursorStyleSequence("block", false), "\x1b[2 q")
+  assert.equal(inputCursorStyleSequence("underscore", true), "\x1b[3 q")
+  assert.equal(inputCursorStyleSequence("underscore", false), "\x1b[4 q")
+  assert.equal(inputCursorStyleSequence("bar", true), "\x1b[5 q")
+  assert.equal(inputCursorStyleSequence("bar", false), "\x1b[6 q")
+})
+
+test("disabled prompt input ignores edits until it is enabled again", () => {
+  initTheme("default")
+  const keybindings = KeybindingsManager.create()
+  setKeybindings(keybindings)
+  const editor = new CustomEditor(
+    new TUI(createMockTerminal(), true),
+    getEditorTheme(),
+    keybindings,
+  )
+
+  editor.setInputDisabled(true)
+  editor.handleInput("blocked")
+  assert.equal(editor.getText(), "")
+
+  editor.setInputDisabled(false)
+  editor.handleInput("allowed")
+  assert.equal(editor.getText(), "allowed")
+})
+
+test("escape interrupts a disabled prompt input", () => {
+  initTheme("default")
+  const keybindings = KeybindingsManager.create()
+  setKeybindings(keybindings)
+  const editor = new CustomEditor(
+    new TUI(createMockTerminal(), true),
+    getEditorTheme(),
+    keybindings,
+  )
+  let interrupted = false
+  editor.onEscape = () => {
+    interrupted = true
+  }
+
+  editor.setInputDisabled(true)
+  editor.handleInput("\x1b")
+
+  assert.equal(interrupted, true)
+})
+
+test("resume pinning can reopen autocomplete at the same selection", async () => {
+  initTheme("default")
+  const keybindings = KeybindingsManager.create()
+  setKeybindings(keybindings)
+  const editor = new CustomEditor(
+    new TUI(createMockTerminal(), true),
+    getEditorTheme(),
+    keybindings,
+  )
+  let selectedIndex = -1
+  editor.requestAutocomplete = () => {
+    editor.autocompleteRequestTask = Promise.resolve().then(() => {
+      editor.autocompleteList = { setSelectedIndex(index) { selectedIndex = index } }
+    })
+  }
+  editor.reopenAutocomplete(3)
+  await new Promise((resolve) => setImmediate(resolve))
+  await new Promise((resolve) => setImmediate(resolve))
+  assert.equal(selectedIndex, 3)
+})
+
+test("resume pin actions run on Tab but never on Enter", () => {
+  initTheme("default")
+  const keybindings = KeybindingsManager.create()
+  setKeybindings(keybindings)
+  const editor = new CustomEditor(
+    new TUI(createMockTerminal(), true),
+    getEditorTheme(),
+    keybindings,
+  )
+  const selected = { value: "/resume 1", label: "Pinned chat" }
+  let pinToggles = 0
+  editor.onAutocompleteTab = () => {
+    pinToggles += 1
+    return true
+  }
+  editor.autocompleteState = "auto"
+  editor.autocompleteList = { getSelectedItem: () => selected }
+  editor.cancelAutocomplete = () => {
+    editor.autocompleteState = null
+  }
+  editor.handleInput("\t")
+  assert.equal(pinToggles, 1)
+
+  editor.autocompleteState = "auto"
+  editor.autocompleteList = {
+    getSelectedItem: () => selected,
+    handleInput: () => {},
+  }
+  editor.autocompleteProvider = {
+    applyCompletion: (lines, cursorLine, cursorCol) => ({ lines, cursorLine, cursorCol }),
+  }
+  editor.autocompletePrefix = "/resume "
+  editor.handleInput("\r")
+  assert.equal(pinToggles, 1)
+})
+
+test("resume autocomplete shows one pin hint at the bottom", () => {
+  initTheme("default")
+  const list = new RelatedAutocompleteSelectList("/resume ", [
+    { value: "/resume 1", label: "First chat", description: "1 minute ago" },
+    { value: "/resume 2", label: "Second chat", description: "2 minutes ago" },
+  ], 10)
+  const rendered = stripAnsi(list.render(100).join("\n"))
+  assert.equal(rendered.split(RESUME_AUTOCOMPLETE_HINT).length - 1, 1)
+  assert.equal(rendered.endsWith(RESUME_AUTOCOMPLETE_HINT), false)
+  assert.match(rendered, /First chat/)
+  assert.match(rendered, /Second chat/)
+})
+
+test("model autocomplete explains Tab editing and Enter selection", () => {
+  initTheme("default")
+  const list = new RelatedAutocompleteSelectList("/model ", [
+    { value: "/model deepseek-v4-pro", label: "deepseek-v4-pro" },
+  ], 10)
+  const rendered = stripAnsi(list.render(100).join("\n"))
+  assert.equal(rendered.split(MODEL_AUTOCOMPLETE_HINT).length - 1, 1)
+  assert.match(rendered, /Tab edit model settings/)
+})
+
+test("pinned chats accept persistent and working rows", () => {
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onSubmit: () => {},
+    terminal: createMockTerminal(),
+    themeName: "default",
+    title: "Test",
+  })
+  assert.doesNotThrow(() => terminal.setPinnedChats([
+    { id: "one", slot: 1, title: "Idle chat", working: false },
+    { id: "two", slot: 2, title: "Working chat", working: true },
+  ]))
+  terminal.stop()
+})
+
+test("pinned chat controls use dedicated focus and visibility shortcuts", () => {
+  const keybindings = KeybindingsManager.create()
+  assert.deepEqual(keybindings.getKeys("app.pins"), ["ctrl+p"])
+  assert.deepEqual(keybindings.getKeys("app.pins.toggle"), ["ctrl+g"])
+  assert.deepEqual(keybindings.getKeys("app.editor.external"), ["alt+e"])
+  assert.ok(keybindings.getKeys("app.message.dequeue").includes("alt+up"))
+  assert.ok(keybindings.getKeys("app.message.nextQueued").includes("alt+down"))
+  assert.ok(keybindings.getKeys("app.message.deleteQueued").includes("alt+backspace"))
+})
+
+test("Windows queue shortcuts include terminal-safe function-key fallbacks", () => {
+  assert.deepEqual(queueKeybindingsForPlatform("darwin"), {
+    deleteQueued: "alt+backspace",
+    nextQueued: "alt+down",
+    previousQueued: "alt+up",
+    sendNow: "alt+enter",
+  })
+  assert.deepEqual(queueKeybindingsForPlatform("win32"), {
+    deleteQueued: ["alt+backspace", "shift+f8"],
+    nextQueued: ["alt+down", "shift+f7"],
+    previousQueued: ["alt+up", "shift+f6"],
+    sendNow: ["alt+enter", "shift+f5"],
+  })
+})
+
+test("backspace on a large paste offers expansion or whole-paste deletion", () => {
+  initTheme("default")
+  const keybindings = KeybindingsManager.create()
+  setKeybindings(keybindings)
+  const createEditor = () => new CustomEditor(
+    new TUI(createMockTerminal(), true),
+    getEditorTheme(),
+    keybindings,
+  )
+  const pastedText = Array.from({ length: 12 }, (_, index) => `line ${index + 1}`).join("\n")
+
+  const editEditor = createEditor()
+  let editActions
+  editEditor.onPasteMarkerBackspace = (actions) => {
+    editActions = actions
+  }
+  editEditor.handleInput(`\x1b[200~${pastedText}\x1b[201~`)
+  assert.match(editEditor.getText(), /^\[paste #1 \+12 lines\]$/)
+  editEditor.handleInput("\x7f")
+  assert.match(editEditor.getText(), /^\[paste #1 \+12 lines\]$/)
+  editActions.editPaste()
+  assert.equal(editEditor.getText(), pastedText)
+
+  const deleteEditor = createEditor()
+  let deleteActions
+  deleteEditor.onPasteMarkerBackspace = (actions) => {
+    deleteActions = actions
+  }
+  deleteEditor.handleInput(`\x1b[200~${pastedText}\x1b[201~`)
+  deleteEditor.handleInput("\x7f")
+  deleteActions.deletePaste()
+  assert.equal(deleteEditor.getText(), "")
+})
+
+test("answered question cards keep the selected choices visible", () => {
+  initTheme("default")
+  const component = new ToolExecutionComponent(
+    "ask_question",
+    "call_question",
+    { questions: [{ id: "color", prompt: "Which colors?", options: ["Red", "Blue"] }] },
+    {},
+    undefined,
+    { requestRender: () => {} },
+    "/tmp",
+  )
+  component.setArgsComplete()
+  component.markExecutionStarted()
+  component.updateResult({
+    content: [{ type: "text", text: 'User answered the questions:\ncolor: user selected "Red"' }],
+    isError: false,
+  })
+
+  const rendered = stripAnsi(component.render(100).join("\n"))
+  assert.match(rendered, /✓ Asked 1 question/)
+  assert.match(rendered, /Which colors\?/)
+  assert.match(rendered, /\[x\] Red/)
+  assert.match(rendered, /\[ \] Blue/)
+})
+
+test("edit tool calls render a diff from Codesh patch arguments", () => {
+  initTheme("default")
+  const component = new ToolExecutionComponent(
+    "edit",
+    "call_edit",
+    {
+      patch: `*** Begin Patch
+*** Update File: src/example.ts
+@@
+-const status = "old"
++const status = "new"
+*** Add File: src/new-file.ts
++export const ready = true
+*** End Patch`,
+    },
+    {},
+    undefined,
+    { requestRender: () => {} },
+    "/tmp",
+  )
+
+  component.setArgsComplete()
+  component.markExecutionStarted()
+  component.updateResult({
+    content: [{ type: "text", text: "Updated src/example.ts (1 hunks)\nAdded src/new-file.ts" }],
+    isError: false,
+  })
+
+  const rendered = stripAnsi(component.render(100).join("\n"))
+  assert.match(rendered, /edit src\/example\.ts, src\/new-file\.ts/)
+  assert.match(rendered, /-  const status = "old"/)
+  assert.match(rendered, /\+  const status = "new"/)
+  assert.match(rendered, /\+  export const ready = true/)
+})
+
+test("tool call summaries use Codesh argument names", () => {
+  initTheme("default")
+  const ui = { requestRender: () => {} }
+  const find = new ToolExecutionComponent(
+    "find",
+    "call_find",
+    { query: "session", path: "src", maxResults: 25 },
+    {},
+    undefined,
+    ui,
+    "/tmp",
+  )
+  const grep = new ToolExecutionComponent(
+    "grep",
+    "call_grep",
+    { pattern: "TODO", path: "src", regex: false, maxResults: 10 },
+    {},
+    undefined,
+    ui,
+    "/tmp",
+  )
+  const bash = new ToolExecutionComponent(
+    "bash",
+    "call_bash",
+    { command: "npm test", timeoutMs: 1500 },
+    {},
+    undefined,
+    ui,
+    "/tmp",
+  )
+
+  assert.match(stripAnsi(find.render(100).join("\n")), /find session in src \(limit 25\)/)
+  assert.match(stripAnsi(grep.render(100).join("\n")), /grep TODO in src limit 10/)
+  assert.match(stripAnsi(bash.render(100).join("\n")), /\$ npm test \(timeout 1\.5s\)/)
+})
+
+test("todo tools render a structured checklist instead of raw JSON", () => {
+  initTheme("default")
+  const todos = [
+    { id: "one", content: "Locate the mods folder", status: "in_progress" },
+    { id: "two", content: "Install Fabric", status: "pending" },
+    { id: "three", content: "Verify the game launches", status: "completed" },
+  ]
+  const component = new ToolExecutionComponent(
+    "todowrite",
+    "call_todo",
+    { todos },
+    {},
+    undefined,
+    { requestRender: () => {} },
+    "/tmp",
+  )
+  component.setArgsComplete()
+  component.markExecutionStarted()
+  component.updateResult({
+    content: [{ type: "text", text: JSON.stringify({ todos, summary: { total: 3 } }) }],
+    isError: false,
+  })
+
+  const rendered = stripAnsi(component.render(100).join("\n"))
+  assert.match(rendered, /Updated todos · 1 active · 1 done/)
+  assert.match(rendered, /◐ Locate the mods folder/)
+  assert.match(rendered, /○ Install Fabric/)
+  assert.match(rendered, /✓ Verify the game launches/)
+  assert.doesNotMatch(rendered, /"todos"|"status"|├─ input|└─ output/)
+
+  const readComponent = new ToolExecutionComponent(
+    "todoread",
+    "call_todo_read",
+    {},
+    {},
+    undefined,
+    { requestRender: () => {} },
+    "/tmp",
+  )
+  readComponent.setArgsComplete()
+  readComponent.markExecutionStarted()
+  readComponent.updateResult({
+    content: [{ type: "text", text: JSON.stringify({ todos, summary: { total: 3 } }) }],
+    isError: false,
+  })
+  assert.match(stripAnsi(readComponent.render(100).join("\n")), /Read todos · 1 active · 1 done/)
+})
+
+test("stfu tool groups collapse adjacent matching calls", () => {
+  initTheme("default")
+  const group = new StfuToolGroup()
+  group.add("call_1", "ls", { path: "src" })
+  group.add("call_2", "ls", { path: "src" })
+  group.add("call_3", "read", { path: "src/cli.ts" })
+  group.update("call_1", "done")
+  group.update("call_2", "done")
+  group.update("call_3", "done")
+
+  const rendered = stripAnsi(group.render(100).join("\n"))
+  assert.match(rendered, /ls src x2/)
+  assert.match(rendered, /read src\/cli\.ts/)
+  assert.equal(compactToolSummary("edit", { patch: "*** Begin Patch\n*** Update File: a.ts\n@@\n-old\n+new\n*** End Patch" }), "edit 1 file")
+})
+
+test("all terminal layouts have distinct structural headers", () => {
+  initTheme("default")
+  assert.deepEqual(LAYOUT_OPTIONS.map((option) => option.value), [
+    "classic",
+    "opencode",
+    "notebook",
+    "console",
+    "asteroid",
+  ])
+
+  let layout = "classic"
+  const header = new LayoutHeaderComponent(() => ({
+    cwd: "/tmp/codesh",
+    layout,
+    mode: "agent",
+    model: "anthropic/claude",
+    themeName: "Default",
+    title: "Test Session",
+    version: "0.1.9",
+  }))
+  const signatures = new Set()
+  for (const option of LAYOUT_OPTIONS) {
+    layout = option.value
+    const rendered = header.render(160).map(stripAnsi).join("\n")
+    assert.match(rendered, /EARLY STAGES · OPEN AN ISSUE IF SOMETHING FEELS OFF/)
+    assert.match(rendered, /https:\/\/github\.com\/nishantsingh211\/codesh\/issues/)
+    signatures.add(rendered)
+  }
+  assert.equal(signatures.size, LAYOUT_OPTIONS.length)
+})
+
+test("all terminal layouts provide distinct empty-session guidance", () => {
+  initTheme("default")
+  let layout = "classic"
+  const emptyTranscript = { invalidate: () => {}, render: () => [] }
+  const surface = new LayoutTranscriptSurface(emptyTranscript, () => ({
+    cwd: "/tmp/codesh",
+    layout,
+    mode: "agent",
+    model: "anthropic/claude",
+    themeName: "Default",
+    title: "Test Session",
+    version: "0.1.9",
+  }))
+  const signatures = new Set()
+  for (const option of LAYOUT_OPTIONS) {
+    layout = option.value
+    const rendered = surface.render(100).map(stripAnsi).join("\n")
+    assert.notEqual(rendered.trim(), "")
+    signatures.add(rendered)
+  }
+  assert.equal(signatures.size, LAYOUT_OPTIONS.length)
+})
+
+test("terminal layouts can switch live without rebuilding terminal state", () => {
+  const terminal = createCodeshTerminal({
+    cwd: "/tmp",
+    layout: "classic",
+    model: "openai/gpt-4o",
+    modelSettings: {},
+    onSubmit: () => {},
+    terminal: createMockTerminal(),
+    themeName: "default",
+    title: "Test",
+  })
+  terminal.setTranscript([
+    { role: "user", content: "hello" },
+    { role: "assistant", content: "hi there" },
+  ])
+  for (const option of LAYOUT_OPTIONS) {
+    assert.doesNotThrow(() => terminal.setLayout(option.value))
+  }
+})
+
+test("footer context display follows Codesh status mode", () => {
+  assert.equal(formatContextDisplay({}, 10_600, 272_000, "3.9"), "10.6K/272K")
+  assert.equal(formatContextDisplay({ statusContextMode: "tokens-percent" }, 10_600, 272_000, "3.9"), "10.6K/272K (3.9%)")
+  assert.equal(formatContextDisplay({ statusContextMode: "percent" }, 10_600, 272_000, "3.9"), "3.9%")
+  assert.equal(formatContextDisplay({ statusContextMode: "off" }, 10_600, 272_000, "3.9"), undefined)
+})
+
+function createFooterFixture() {
+  initTheme("default")
+  const session = {
+    state: {
+      configuredContextWindow: 128_000,
+      fast: true,
+      forkParentTitle: "Parent Chat",
+      mode: "plan",
+      model: { id: "gpt-5.5", name: "GPT-5.5", provider: "openai", contextWindow: 272_000, reasoning: true },
+      totalCostUsd: 1.2345,
+      themeName: "Default",
+      thinkingLevel: "off",
+    },
+    sessionManager: {
+      getCwd: () => "/tmp/codesh",
+      getEntries: () => [{
+        type: "message",
+        message: {
+          role: "assistant",
+          usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0.1234 } },
+        },
+      }],
+      getSessionName: () => "New Chat",
+    },
+    modelRegistry: { isUsingOAuth: () => false },
+    getContextUsage: () => ({ tokens: 10_600, contextWindow: 272_000, percent: 3.9 }),
+  }
+  const footerData = {
+    getAvailableProviderCount: () => 1,
+    getExtensionStatuses: () => new Map([["mode", "plan mode"]]),
+    getGitBranch: () => "main",
+  }
+  return { session, footerData }
+}
+
+test("footer status toggles show configured status parts", () => {
+  const { session, footerData } = createFooterFixture()
+  const footer = new FooterComponent(session, footerData, {})
+
+  const rendered = footer.render(160).map(stripAnsi).join("\n")
+  for (const visible of ["Codesh", "/tmp/codesh", "main", "New Chat", "$0.1234", "10.6K/272K", "mode: plan", "window: 128K", "reasoning: none", "fast", "theme: Default", "GPT-5.5", "fork of: Parent Chat"]) {
+    assert.equal(rendered.includes(visible), true, `expected footer to show ${visible}`)
+  }
+})
+
+test("footer highlights the active mode value", () => {
+  const { session, footerData } = createFooterFixture()
+  const footer = new FooterComponent(session, footerData, {})
+
+  const rendered = footer.render(160).join("\n")
+  assert.match(rendered, /mode:(?:\x1b\[[0-9;]*m)?\s*(?:\x1b\[[0-9;]*m)+plan/)
+})
+
+test("footer colors app name, path, and branch on the status line", () => {
+  initTheme("space")
+  const { session, footerData } = createFooterFixture()
+  const footer = new FooterComponent(session, footerData, {})
+
+  const [pwdLine, statsLine] = footer.render(160)
+  assert.match(pwdLine, /\x1b\[[0-9;]*mCodesh/)
+  assert.match(pwdLine, /\x1b\[[0-9;]*mmain/)
+  assert.doesNotMatch(pwdLine, /^\x1b\[2m|^[^\x1b]*Codesh/)
+  assert.equal(stripAnsi(pwdLine).includes("Codesh"), true)
+  assert.equal(stripAnsi(pwdLine).includes("/tmp/codesh (main)"), true)
+
+  assert.match(statsLine, /\x1b\[[0-9;]*m\$0\.1234/)
+  assert.match(statsLine, /\x1b\[[0-9;]*m10\.6K\/272K/)
+  assert.match(statsLine, /\x1b\[[0-9;]*mGPT-5\.5/)
+  assert.match(statsLine, /mode:(?:\x1b\[[0-9;]*m)?\s*(?:\x1b\[[0-9;]*m)+plan/)
+})
+
+test("footer shows all active response modes together", () => {
+  const { session, footerData } = createFooterFixture()
+  footerData.getExtensionStatuses = () => new Map([["response-modes", "modes: stfu + caveman"]])
+  const footer = new FooterComponent(session, footerData, {})
+
+  const rendered = footer.render(160).map(stripAnsi).join("\n")
+  assert.match(rendered, /modes: stfu \+ caveman/)
+})
+
+test("footer cost mode switches between session, total key cost, and off", () => {
+  const { session, footerData } = createFooterFixture()
+  const sessionFooter = new FooterComponent(session, footerData, { statusCostMode: "session" })
+  assert.match(sessionFooter.render(160).map(stripAnsi).join("\n"), /\$0\.1234/)
+
+  const totalFooter = new FooterComponent(session, footerData, { statusCostMode: "total" })
+  const total = totalFooter.render(160).map(stripAnsi).join("\n")
+  assert.match(total, /\$1\.23 total/)
+  assert.doesNotMatch(total, /\$0\.1234/)
+
+  const hiddenFooter = new FooterComponent(session, footerData, { statusCostMode: "off" })
+  assert.doesNotMatch(hiddenFooter.render(160).map(stripAnsi).join("\n"), /\$/)
+})
+
+test("footer marks incomplete provider costs instead of presenting zero as exact", () => {
+  const { session, footerData } = createFooterFixture()
+  session.state.sessionCostIncomplete = true
+  session.sessionManager.getEntries = () => []
+
+  const footer = new FooterComponent(session, footerData, { statusCostMode: "session" })
+  assert.match(footer.render(160).map(stripAnsi).join("\n"), /cost unavailable/)
+
+  session.sessionManager.getEntries = () => [{
+    type: "message",
+    message: {
+      role: "assistant",
+      usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: { total: 0.1234 } },
+    },
+  }]
+  assert.match(footer.render(160).map(stripAnsi).join("\n"), /\$0\.1234\+/)
+})
+
+test("footer status toggles hide configured status parts", () => {
+  const { session, footerData } = createFooterFixture()
+  const footer = new FooterComponent(session, footerData, {
+    statusShowAppName: false,
+    statusShowCost: false,
+    statusShowCwd: false,
+    statusShowFast: false,
+    statusShowForkParent: false,
+    statusShowMode: false,
+    statusShowModel: false,
+    statusShowReasoning: false,
+    statusShowTheme: false,
+    statusShowTitle: false,
+    statusShowWindow: false,
+  })
+
+  const rendered = footer.render(120).map(stripAnsi).join("\n")
+  for (const hidden of ["Codesh", "/tmp/codesh", "main", "New Chat", "$0.1234", "GPT-5.5", "reasoning:", "mode:", "plan mode", "window:", "fast", "theme:", "Parent Chat"]) {
+    assert.equal(rendered.includes(hidden), false, `expected footer to hide ${hidden}`)
+  }
+  assert.equal(rendered.includes("10.6K/272K"), true)
+})
