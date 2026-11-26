@@ -11,6 +11,7 @@ Use this index to understand the harness before changing it. Read the architectu
 | [Sessions](docs/architecture/sessions.md) | SQLite persistence, entry trees, forks, model projection, and history |
 | [Interfaces](docs/architecture/interfaces.md) | Interactive TUI, headless output, prompt queues, commands, and images |
 | [How things work under the hood](docs/architecture/how-things-work-under-the-hood.md) | Request lifecycle, HTTP/SSE transport, protocol adapters, streaming parser, and tool loop |
+| [Cross-provider context handoff](docs/architecture/cross-provider-context-handoff.md) | 3-tier architecture for mid-session model/provider switching without losing state |
 
 ## Systems
 
